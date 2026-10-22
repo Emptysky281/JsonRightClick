@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: cmd
+        run: build.bat
+      - name: Self test
+        shell: pwsh
+        run: |
+          $p = Start-Process .\JsonRightClick.exe -ArgumentList '--selftest','samples\sample.log','selftest.txt' -Wait -PassThru
+          Get-Content selftest.txt -TotalCount 1
+          if ($p.ExitCode -ne 0) { exit 1 }
+          if (-not (Select-String selftest.txt -Pattern 'REFORMAT STABLE == True' -Quiet)) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JsonRightClick
+          path: |
+            JsonRightClick.exe
+            JsonRightClickMenu.exe
+            app.ico
+            README.md
+            LICENSE

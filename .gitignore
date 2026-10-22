@@ -1,0 +1,17 @@
+# 编译产物
+*.exe
+*.pdb
+perf_test.exe
+
+# 运行时生成（每台电脑不同）
+settings.ini
+Fonts/
+ShellPackage/
+*.log
+!samples/*.log
+crash*.txt
+
+# 杂项
+*.tmp
+Thumbs.db
+desktop.ini
