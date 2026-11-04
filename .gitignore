@@ -15,3 +15,7 @@ crash*.txt
 *.tmp
 Thumbs.db
 desktop.ini
+
+# 本地验证及可分发构建
+.test-output/
+dist/

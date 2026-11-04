@@ -252,7 +252,7 @@ namespace JsonRightClick
     /// RichTextBox 默认每格滚轮直接跳 3 行，显得一顿一顿的。这里接管滚轮：
     /// 累计目标位置，用约 8ms 一帧的缓动动画逐像素滚过去；快速连续滚动时速度会叠加。
     /// </summary>
-    sealed class CodeBox : RichTextBox
+    sealed partial class CodeBox : RichTextBox
     {
         public event Action<int> CtrlWheel;
         readonly System.Windows.Forms.Timer anim = new System.Windows.Forms.Timer { Interval = 8 };
@@ -264,18 +264,26 @@ namespace JsonRightClick
         /// <summary>搜索结果高亮：[起点, 长度]，按起点排序。当前选中的那个由系统选区颜色显示。</summary>
         public List<int[]> Highlights = new List<int[]>();
         public Color HighlightColor = Color.FromArgb(110, 255, 200, 0);
+        public event Action ViewportChanged;
+        int bracketOpen = -1, bracketClose = -1, bracketAnchor = -1;
+        string openContext, closeContext;
+        bool previewJumped;
+        public int BracketOpen { get { return bracketOpen; } }
+        public int BracketClose { get { return bracketClose; } }
         static float dpi;
 
         public CodeBox()
         {
             anim.Tick += delegate { Step(); };
+            folding = new CodeFolding(this);
         }
 
         // 在 RichEdit 自己绘制完后，只在本次重绘区域内叠加半透明高亮，不改动文字格式（不影响撤销）
         void PaintHighlights(Region clip)
         {
             if (Highlights.Count == 0) return;
-            var cb = Rectangle.Round(clip.GetBounds(Graphics.FromHwnd(Handle)));
+            Rectangle cb;
+            using (var graphics = Graphics.FromHwnd(Handle)) cb = Rectangle.Round(clip.GetBounds(graphics));
             if (cb.Width <= 0 || cb.Height <= 0) return;
             int a = GetCharIndexFromPosition(new Point(0, Math.Max(0, cb.Top)));
             int lineA = GetLineFromCharIndex(a);
@@ -305,10 +313,12 @@ namespace JsonRightClick
                     int i = s;
                     while (i < e)
                     {
+                        int visible = folding.SkipHidden(i);
+                        if (visible != i) { i = Math.Min(e, visible); continue; }
                         var p0 = GetPositionFromCharIndex(i);
                         int line = GetLineFromCharIndex(i);
                         int j = i + 1;
-                        while (j < e && GetLineFromCharIndex(j) == line) j++;
+                        while (j < e && !folding.IsHidden(j) && GetLineFromCharIndex(j) == line) j++;
                         int x1;
                         var pe = GetPositionFromCharIndex(j - 1);
                         x1 = pe.X + cw;
@@ -321,10 +331,84 @@ namespace JsonRightClick
             }
         }
 
+        // 括号提示与搜索高亮一样只叠加绘制，不改变 RTF、选区、剪贴板或撤销记录。
+        public void SetBracketMatch(int open, int close, int anchor, string first, string last)
+        {
+            if (bracketOpen == open && bracketClose == close && bracketAnchor == anchor && openContext == first && closeContext == last) return;
+            bracketOpen = open; bracketClose = close; bracketAnchor = anchor;
+            openContext = first; closeContext = last;
+            Invalidate();
+        }
+
+        public void ClearBracketMatch() { SetBracketMatch(-1, -1, -1, null, null); }
+
+        Rectangle BracketRectangle(int index)
+        {
+            Point p = GetPositionFromCharIndex(index), next = GetPositionFromCharIndex(index + 1);
+            if (dpi == 0) using (var g = Graphics.FromHwnd(IntPtr.Zero)) dpi = g.DpiX;
+            int width = next.Y == p.Y && next.X > p.X ? next.X - p.X :
+                Math.Max(4, (int)Math.Round(Native.FontCharWidthTwips(ViewSettings.FontName, ViewSettings.FontSize) * dpi / 1440f));
+            return new Rectangle(p.X - 1, p.Y, width + 2, LineHeight);
+        }
+
+        internal bool TryGetBracketPreview(out int target, out Rectangle bounds, out string text)
+        {
+            target = -1; bounds = Rectangle.Empty; text = null;
+            if (bracketOpen < 0 || bracketClose >= TextLength || ClientSize.Width < 90 || ClientSize.Height < 80) return false;
+            target = bracketAnchor == bracketOpen ? bracketClose : bracketOpen;
+            Rectangle at = BracketRectangle(target);
+            if (ClientRectangle.Contains(at)) return false;
+            int height = TextRenderer.MeasureText("Ag", SystemFonts.MessageBoxFont).Height + 12;
+            int y = at.Top < 0 ? 4 : ClientSize.Height - height - 4;
+            bounds = new Rectangle(4, y, ClientSize.Width - 8, height);
+            string arrow = at.Top < 0 ? "↑ " : at.Bottom > ClientSize.Height ? "↓ " : "↔ ";
+            text = arrow + (target == bracketOpen ? openContext : closeContext) + L.T("  · 点击跳转", "  · Click to jump");
+            return true;
+        }
+
+        void PaintBrackets(Region clip)
+        {
+            if (bracketOpen < 0 || bracketClose >= TextLength) return;
+            var th = Theme.Current;
+            using (var g = Graphics.FromHwnd(Handle))
+            using (var fill = new SolidBrush(Color.FromArgb(th.Dark ? 85 : 55, th.Accent)))
+            using (var pen = new Pen(th.Accent))
+            {
+                g.SetClip(clip, CombineMode.Replace);
+                foreach (int index in new[] { bracketOpen, bracketClose })
+                {
+                    if (folding.IsHidden(index)) continue;
+                    Rectangle r = BracketRectangle(index);
+                    if (!ClientRectangle.IntersectsWith(r)) continue;
+                    g.FillRectangle(fill, r);
+                    g.DrawRectangle(pen, r.X, r.Y, r.Width - 1, r.Height - 1);
+                }
+                int target; Rectangle bounds; string text;
+                if (TryGetBracketPreview(out target, out bounds, out text))
+                {
+                    using (var background = new SolidBrush(th.Menu)) g.FillRectangle(background, bounds);
+                    g.DrawRectangle(pen, bounds.X, bounds.Y, bounds.Width - 1, bounds.Height - 1);
+                    bounds.Inflate(-7, -3);
+                    TextRenderer.DrawText(g, text, SystemFonts.MessageBoxFont, bounds, th.BarFore,
+                        TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.PreserveGraphicsClipping);
+                }
+            }
+        }
+
+        void OnViewportChanged()
+        {
+            if (Highlights.Count > 0 || bracketOpen >= 0 || (folding != null && folding.CollapsedCount > 0)) Invalidate();
+            var handler = ViewportChanged;
+            if (handler != null) handler();
+        }
+
+        protected override void OnVScroll(EventArgs e) { base.OnVScroll(e); OnViewportChanged(); }
+        protected override void OnHScroll(EventArgs e) { base.OnHScroll(e); OnViewportChanged(); }
+
         public Point ScrollPos
         {
             get { var p = new Native.POINT(); Native.SendMessage(Handle, 0x04DD /* EM_GETSCROLLPOS */, IntPtr.Zero, ref p); return new Point(p.X, p.Y); }
-            set { var p = new Native.POINT { X = value.X, Y = value.Y }; Native.SendMessage(Handle, 0x04DE /* EM_SETSCROLLPOS */, IntPtr.Zero, ref p); }
+            set { var p = new Native.POINT { X = value.X, Y = value.Y }; Native.SendMessage(Handle, 0x04DE /* EM_SETSCROLLPOS */, IntPtr.Zero, ref p); OnViewportChanged(); }
         }
 
         int MaxScroll(out bool ok)
@@ -338,6 +422,7 @@ namespace JsonRightClick
 
         protected override void WndProc(ref Message m)
         {
+            if (HandleFoldingMessage(ref m)) return;
             switch (m.Msg)
             {
                 case 0x020A: // WM_MOUSEWHEEL
@@ -348,20 +433,34 @@ namespace JsonRightClick
                         break;
                     }
                 case 0x000F: // WM_PAINT
-                    if (Highlights.Count > 0)
+                    if (Highlights.Count > 0 || bracketOpen >= 0 || folding.CollapsedCount > 0)
                     {
                         IntPtr rgn = Native.CreateRectRgn(0, 0, 0, 0);
                         Native.GetUpdateRgn(Handle, rgn, false);
                         base.WndProc(ref m);
-                        try { using (var clip = Region.FromHrgn(rgn)) PaintHighlights(clip); }
+                        try { using (var clip = Region.FromHrgn(rgn)) { PaintHighlights(clip); folding.Paint(clip); PaintBrackets(clip); } }
                         catch { }
                         finally { Native.DeleteObject(rgn); }
                         return;
                     }
                     break;
+                case 0x0201: // WM_LBUTTONDOWN：预览条点击不应先被 RichEdit 当作普通文本点击。
+                    StopSmooth();
+                    int target; Rectangle bounds; string text;
+                    var point = new Point((short)(m.LParam.ToInt64() & 0xFFFF), (short)((m.LParam.ToInt64() >> 16) & 0xFFFF));
+                    if (TryGetBracketPreview(out target, out bounds, out text) && bounds.Contains(point))
+                    {
+                        previewJumped = true;
+                        Focus(); Select(target, 0); ScrollToCaret(); OnViewportChanged();
+                        return;
+                    }
+                    break;
+                case 0x0202: // WM_LBUTTONUP
+                    if (previewJumped) { previewJumped = false; return; }
+                    break;
                 case 0x0115: // WM_VSCROLL：拖动滚动条等，停止动画
+                case 0x0114: // WM_HSCROLL
                 case 0x0100: // WM_KEYDOWN
-                case 0x0201: // WM_LBUTTONDOWN
                     StopSmooth();
                     break;
             }
@@ -421,7 +520,7 @@ namespace JsonRightClick
         protected override void Dispose(bool disposing)
         {
             StopSmooth();
-            if (disposing) anim.Dispose();
+            if (disposing) { anim.Dispose(); if (folding != null) folding.Dispose(); }
             base.Dispose(disposing);
         }
     }

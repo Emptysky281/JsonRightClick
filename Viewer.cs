@@ -32,8 +32,8 @@ namespace JsonRightClick
         readonly ToolStripButton btnWrap, btnOnly, btnTop, btnTheme, btnPrev, btnNext, btnMask, btnTree, btnRegex, btnCase;
         readonly ToolStripTextBox search;
         readonly ToolStripLabel searchCount = new ToolStripLabel("");
-        readonly ToolStripDropDownButton btnSettings;
-        readonly ToolTip tip = new ToolTip { InitialDelay = 0, ReshowDelay = 0, AutoPopDelay = 20000, UseAnimation = false, UseFading = false };
+        readonly ToolStripDropDownButton btnSettings, btnFolding;
+        readonly CursorToolTip tip = new CursorToolTip();
         readonly System.Windows.Forms.Timer matchTimer = new System.Windows.Forms.Timer { Interval = 180 };
         readonly System.Windows.Forms.Timer pathTimer = new System.Windows.Forms.Timer { Interval = 120 };
         readonly System.Windows.Forms.Timer treeTimer = new System.Windows.Forms.Timer { Interval = 600 };
@@ -65,14 +65,17 @@ namespace JsonRightClick
         string textCache = "";
         List<JNode> domRoots = new List<JNode>();
         Font treeFont;
+        BracketIndex bracketIndex;
+        int bracketVersion = -1;
 
         // 格式化等操作的撤销记录
         sealed class Snapshot { public string Display; public List<Piece> Pieces; public bool ShownOnly; public string After; }
         readonly List<Snapshot> history = new List<Snapshot>();
 
         // 悬停提示
-        int tipStart = -2;
-        Point lastMouse;
+        int tipStart = -2, tipEnd, tipVersion = -1;
+        string tipText;
+        Point lastMouse = new Point(-1, -1);
         int menuIndex = -1;
         string menuJwt, menuNested;
 
@@ -99,6 +102,10 @@ namespace JsonRightClick
             tools.Items.Add(new ToolStripButton(L.T("格式化"), null, delegate { Reprocess(false, false); }) { ToolTipText = L.T("重新格式化 (Ctrl+Enter)") });
             tools.Items.Add(new ToolStripButton(L.T("压缩"), null, delegate { Reprocess(true, false); }) { ToolTipText = L.T("压缩为一行") });
             tools.Items.Add(new ToolStripButton(L.T("展开嵌套"), null, delegate { Reprocess(false, true); }) { ToolTipText = L.T("把内容是 JSON 的字符串（如 \"data\":\"{\\\"a\\\":1}\"）展开成对象，可 Ctrl+Z 撤销") });
+            btnFolding = new ToolStripDropDownButton(L.T("折叠", "Fold"));
+            AddFoldingMenu(btnFolding.DropDownItems);
+            btnFolding.DropDownOpening += delegate { ApplyRenderer(btnFolding.DropDown); };
+            tools.Items.Add(btnFolding);
             tools.Items.Add(new ToolStripButton(L.T("复制全部"), null, delegate { CopyAll(); }));
             tools.Items.Add(new ToolStripSeparator());
             btnOnly = new ToolStripButton(L.T("只看 JSON")) { CheckOnClick = true, ToolTipText = L.T("暂时隐藏日志中 JSON 以外的文字（不会删除）") };
@@ -168,12 +175,25 @@ namespace JsonRightClick
             box.HandleCreated += delegate { WordBreak.Attach(box); };
             box.TextChanged += delegate
             {
+                if (box.FoldingFormatting) return;
                 textVersion++;
+                bracketIndex = null; bracketVersion = -1;
+                box.ClearBracketMatch();
+                HideTip();
+                if (!rendering) { box.RebuildFolding(BoxText, true); UpdateBrackets(); }
                 if (!rendering && !edited) { edited = true; UpdateTitle(); }
                 if (search.Text.Length > 0) { matchTimer.Stop(); matchTimer.Start(); }
                 if (btnTree.Checked) { treeTimer.Stop(); treeTimer.Start(); }
             };
-            box.SelectionChanged += delegate { if (!rendering) { pathTimer.Stop(); pathTimer.Start(); } };
+            box.SelectionChanged += delegate
+            {
+                if (!rendering && !box.FoldingFormatting) { UpdateBrackets(); pathTimer.Stop(); pathTimer.Start(); }
+            };
+            box.MouseUp += (s, e) =>
+            {
+                if (e.Button == MouseButtons.Left && !rendering && box.SelectionLength == 0)
+                    UpdateBrackets(box.GetCharIndexFromPosition(e.Location));
+            };
             box.CtrlWheel += delegate(int delta)
             {
                 wheelAcc += delta;
@@ -182,8 +202,18 @@ namespace JsonRightClick
             };
             box.MouseMove += (s, e) => { if (e.Location != lastMouse) { lastMouse = e.Location; HoverAt(e.Location); } };
             box.MouseLeave += delegate { HideTip(); };
+            box.MouseDown += delegate { HideTip(); };
+            box.LostFocus += delegate { HideTip(); };
             box.KeyDown += delegate { HideTip(); };
-            box.VScroll += delegate { HideTip(); };
+            box.ViewportChanged += delegate { HideTip(); };
+            box.FoldingChanged += delegate
+            {
+                HideTip();
+                if (!rendering) { UpdateBrackets(); pathTimer.Stop(); pathTimer.Start(); }
+                if (large) { coloredBlocks.Clear(); colorTimer.Stop(); colorTimer.Start(); }
+            };
+            box.Resize += delegate { HideTip(); };
+            Deactivate += delegate { HideTip(); };
 
             matchTimer.Tick += delegate { matchTimer.Stop(); UpdateMatches(matchSelectPending); };
             pathTimer.Tick += delegate { pathTimer.Stop(); UpdatePath(); };
@@ -200,6 +230,7 @@ namespace JsonRightClick
             split.Orientation = Orientation.Vertical;
             split.SplitterWidth = 5;
             split.Panel1.Controls.Add(box);
+            split.Panel1.Controls.Add(box.FoldingGutter);
             split.Panel2.Controls.Add(tree);
             split.Panel2Collapsed = true;
             split.Panel2MinSize = 120;
@@ -256,11 +287,14 @@ namespace JsonRightClick
             if (btnTree.Checked) ShowTreePanel(true);
         }
 
-        protected override void OnFormClosed(FormClosedEventArgs e)
+        protected override void Dispose(bool disposing)
         {
-            matchTimer.Dispose(); pathTimer.Dispose(); treeTimer.Dispose(); colorTimer.Dispose(); tip.Dispose();
-            if (treeFont != null) treeFont.Dispose();
-            base.OnFormClosed(e);
+            if (disposing)
+            {
+                matchTimer.Dispose(); pathTimer.Dispose(); treeTimer.Dispose(); colorTimer.Dispose(); tip.Dispose();
+                if (treeFont != null) { treeFont.Dispose(); treeFont = null; }
+            }
+            base.Dispose(disposing);
         }
 
         string BoxText
@@ -482,6 +516,8 @@ namespace JsonRightClick
             box.HighlightColor = th.Highlight;
             if (box.ContextMenuStrip != null) ApplyRenderer(box.ContextMenuStrip);
             ApplyRenderer(btnSettings.DropDown);
+            ApplyRenderer(btnFolding.DropDown);
+            box.FoldingGutter.Invalidate();
             tree.ApplyTheme(th, TreeFont());
             search.BackColor = th.InputBack;
             search.ForeColor = th.Fore;
@@ -543,6 +579,7 @@ namespace JsonRightClick
             finally { rendering = false; }
             edited = keepEdited;
             UpdateTitle();
+            UpdateBrackets();
         }
 
         void SetContent(string text, List<int[]> ranges)
@@ -567,8 +604,10 @@ namespace JsonRightClick
                 box.ClearUndo();
             }
             finally { rendering = false; }
+            box.RebuildFolding(BoxText, false);
             if (large) { ColorVisible(); box.ClearUndo(); }
             if (search.Text.Length > 0) UpdateMatches(false);
+            UpdateBrackets();
         }
 
         /// <summary>大文件模式：给当前可见区域（及上下各一块）着色，已着色的块不重复处理</summary>
@@ -591,31 +630,37 @@ namespace JsonRightClick
             Native.SendMessage(box.Handle, 0x000B /* WM_SETREDRAW */, IntPtr.Zero, IntPtr.Zero);
             try
             {
-                foreach (int b in todo)
+                using (var undo = RichEditFold.UndoScope(box.Handle))
                 {
-                    coloredBlocks.Add(b);
-                    int s = box.GetFirstCharIndexFromLine(b * ColorBlock);
-                    if (s < 0) continue;
-                    int e = box.GetFirstCharIndexFromLine((b + 1) * ColorBlock);
-                    if (e < 0) e = t.Length;
-                    foreach (var r in largeRanges)
+                    foreach (int b in todo)
                     {
-                        int rs = Math.Max(s, r[0]), re = Math.Min(e, r[0] + r[1]);
-                        if (rs >= re) continue;
-                        // 从行首开始切分，保证不会从字符串中间开始
-                        int ls = t.LastIndexOf('\n', Math.Max(0, rs - 1)) + 1;
-                        if (ls < r[0]) ls = r[0];
-                        Rtf.Tokenize(t, ls, re, (i, n, c) =>
+                        coloredBlocks.Add(b);
+                        int s = box.GetFirstCharIndexFromLine(b * ColorBlock);
+                        if (s < 0) continue;
+                        int e = box.GetFirstCharIndexFromLine((b + 1) * ColorBlock);
+                        if (e < 0) e = t.Length;
+                        foreach (var r in largeRanges)
                         {
-                            if (c == 1 || i + n <= rs) return;
-                            box.Select(i, n);
-                            box.SelectionColor = th.Syntax[c];
-                        });
+                            int rs = Math.Max(s, r[0]), re = Math.Min(e, r[0] + r[1]);
+                            if (rs >= re) continue;
+                            // 从行首开始切分，保证不会从字符串中间开始
+                            int ls = t.LastIndexOf('\n', Math.Max(0, rs - 1)) + 1;
+                            if (ls < r[0]) ls = r[0];
+                            Rtf.Tokenize(t, ls, re, (i, n, c) =>
+                            {
+                                if (c == 1 || i + n <= rs) return;
+                                box.Folding.EachVisibleRange(i, n, (start, length) =>
+                                {
+                                    box.Select(start, length);
+                                    box.SelectionColor = th.Syntax[c];
+                                });
+                            });
+                        }
                     }
+                    box.Select(selStart, selLen);
+                    int nowFirst = (int)Native.SendMessage(box.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
+                    if (nowFirst != firstVisible) Native.SendMessage(box.Handle, 0x00B6 /* EM_LINESCROLL */, IntPtr.Zero, (IntPtr)(firstVisible - nowFirst));
                 }
-                box.Select(selStart, selLen);
-                int nowFirst = (int)Native.SendMessage(box.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
-                if (nowFirst != firstVisible) Native.SendMessage(box.Handle, 0x00B6 /* EM_LINESCROLL */, IntPtr.Zero, (IntPtr)(firstVisible - nowFirst));
             }
             finally
             {
@@ -624,6 +669,28 @@ namespace JsonRightClick
                 box.Invalidate();
             }
             if (!hadUndo) box.ClearUndo(); // 着色不算编辑；已有编辑时保留撤销记录
+            UpdateBrackets();
+        }
+
+        void AddFoldingMenu(ToolStripItemCollection items, bool context = false)
+        {
+            var collapse = new ToolStripMenuItem(L.T("折叠此层级", "Fold current block"), null, delegate { SetFold(true, false, context ? menuIndex : -1); });
+            collapse.ShortcutKeyDisplayString = "Ctrl+Shift+[";
+            var expand = new ToolStripMenuItem(L.T("展开此层级", "Expand current block"), null, delegate { SetFold(false, false, context ? menuIndex : -1); });
+            expand.ShortcutKeyDisplayString = "Ctrl+Shift+]";
+            items.Add(collapse); items.Add(expand);
+            items.Add(new ToolStripSeparator());
+            items.Add(new ToolStripMenuItem(L.T("全部折叠", "Fold all"), null, delegate { SetFold(true, true); }) { ShortcutKeyDisplayString = "Ctrl+Alt+[" });
+            items.Add(new ToolStripMenuItem(L.T("全部展开", "Expand all"), null, delegate { SetFold(false, true); }) { ShortcutKeyDisplayString = "Ctrl+Alt+]" });
+        }
+
+        void SetFold(bool collapsed, bool all, int position = -1)
+        {
+            HideTip();
+            if (all) box.FoldAll(collapsed);
+            else if (position >= 0) box.Folding.SetAt(position, collapsed);
+            else box.FoldCurrent(collapsed);
+            box.Focus();
         }
 
         // ---------- 右键菜单 ----------
@@ -637,6 +704,10 @@ namespace JsonRightClick
             m.Items.Add(L.T("复制 (Ctrl+C)"), null, delegate { CopySelection(); });
             m.Items.Add(L.T("粘贴 (Ctrl+V)"), null, delegate { PastePlain(); });
             m.Items.Add(L.T("全选 (Ctrl+A)"), null, delegate { box.SelectAll(); });
+            m.Items.Add(new ToolStripSeparator());
+            var folding = new ToolStripMenuItem(L.T("代码折叠", "Code folding"));
+            AddFoldingMenu(folding.DropDownItems, true);
+            m.Items.Add(folding);
             m.Items.Add(new ToolStripSeparator());
             miDecode.Click += delegate { var j = Jwt.Decode(menuJwt); if (j != null) new JsonViewer(j.Report()).Show(); };
             miNested.Click += delegate { if (menuNested != null) new JsonViewer(menuNested).Show(); };
@@ -732,6 +803,7 @@ namespace JsonRightClick
                 titleBase = L.T("JSON 解析");
             }
             UpdateTitle();
+            UpdateBrackets();
             UpdatePath();
             if (btnTree.Checked) RebuildTree();
         }
@@ -848,8 +920,9 @@ namespace JsonRightClick
         void SelectMatch(int i)
         {
             rendering = true;
-            try { box.Select(matches[i][0], matches[i][1]); CenterOn(matches[i][0]); }
+            try { box.RevealRange(matches[i][0], matches[i][1]); box.Select(matches[i][0], matches[i][1]); CenterOn(matches[i][0]); }
             finally { rendering = false; }
+            UpdateBrackets();
             box.Invalidate();
             pathTimer.Stop(); pathTimer.Start();
         }
@@ -885,10 +958,35 @@ namespace JsonRightClick
         void CenterOn(int charIndex)
         {
             box.StopSmooth();
+            box.RevealRange(charIndex, 0);
             int y = box.GetPositionFromCharIndex(charIndex).Y;
             if (y >= 0 && y < box.ClientSize.Height - 40) return; // 已经在可见区域
             var p = box.ScrollPos;
             box.ScrollPos = new Point(p.X, Math.Max(0, p.Y + y - box.ClientSize.Height / 3));
+        }
+
+        // ---------- 括号配对 ----------
+        void UpdateBrackets(int clickedIndex = -1)
+        {
+            if (IsDisposed || Disposing || box.IsDisposed) return;
+            if (box.SelectionLength != 0) { box.ClearBracketMatch(); return; }
+            string text = BoxText;
+            int at = clickedIndex >= 0 ? clickedIndex : box.SelectionStart;
+            bool adjacent = clickedIndex < 0;
+            if (!BracketIndex.IsBracket(text, at) && (!adjacent || !BracketIndex.IsBracket(text, at - 1)))
+            { box.ClearBracketMatch(); return; }
+            if (bracketIndex == null || bracketVersion != textVersion)
+            {
+                bracketIndex = box.FoldingIndexFor(text) ?? new BracketIndex(text);
+                bracketVersion = textVersion;
+            }
+            int other;
+            if (!bracketIndex.TryGetPair(at, out other))
+            {
+                if (!adjacent || !bracketIndex.TryGetPair(--at, out other)) { box.ClearBracketMatch(); return; }
+            }
+            int open = Math.Min(at, other), close = Math.Max(at, other);
+            box.SetBracketMatch(open, close, at, bracketIndex.ContextAt(open), bracketIndex.ContextAt(close));
         }
 
         // ---------- 结构 / 路径 / 树形 ----------
@@ -950,8 +1048,13 @@ namespace JsonRightClick
             while (real != null && real.Virtual) real = real.Parent;
             if (real == null || domVersion != textVersion) return;
             rendering = true;
-            try { box.Select(real.Start, Math.Max(0, Math.Min(real.End, box.TextLength) - real.Start)); CenterOn(real.Start); }
+            try
+            {
+                box.RevealRange(real.Start, Math.Max(0, real.End - real.Start));
+                box.Select(real.Start, Math.Max(0, Math.Min(real.End, box.TextLength) - real.Start)); CenterOn(real.Start);
+            }
             finally { rendering = false; }
+            UpdateBrackets();
             box.Invalidate();
         }
 
@@ -964,7 +1067,6 @@ namespace JsonRightClick
             if (idx < 0 || idx >= t.Length) return null;
             int ls = t.LastIndexOf('\n', idx) + 1;
             int le = t.IndexOf('\n', idx); if (le < 0) le = t.Length;
-            if (idx - ls > 20000) ls = idx - 20000; // 超长单行只看附近
             int i = ls;
             while (i < le)
             {
@@ -1001,15 +1103,20 @@ namespace JsonRightClick
 
         void HoverAt(Point pt)
         {
-            if (BoxText.Length == 0) { HideTip(); return; }
+            if (BoxText.Length == 0 || box.IsFoldPlaceholder(pt)) { HideTip(); return; }
             int idx = box.GetCharIndexFromPosition(pt);
             var cp = box.GetPositionFromCharIndex(idx);
             if (Math.Abs(cp.Y + box.LineHeight / 2 - pt.Y) > box.LineHeight || Math.Abs(cp.X - pt.X) > 40) { HideTip(); return; }
+            // 同一段长字符串内移动时复用解析结果，但每次都跟随鼠标更新提示位置。
+            if (tipVersion == textVersion && idx >= tipStart && idx < tipEnd)
+            {
+                if (tipText != null) tip.ShowNear(tipText, box, pt);
+                return;
+            }
             int s, e;
             string val;
             string kind = TokenAt(idx, out s, out e, out val);
             if (kind == null) { HideTip(); return; }
-            if (s == tipStart) return;
             string text = null;
             if (kind == "number") text = TimeHint.Describe(val);
             else if (val.Length <= 15) text = TimeHint.Describe(val);
@@ -1024,17 +1131,17 @@ namespace JsonRightClick
                         text = L.T("这个字符串的内容是 JSON\n点工具栏「展开嵌套」可就地展开，或右键 → 在新窗口解析");
                 }
             }
-            if (text == null) { HideTip(); return; }
-            tipStart = s;
-            var at = box.GetPositionFromCharIndex(e > 0 ? e - 1 : s);
-            tip.Show(text, box, Math.Min(pt.X + 12, box.ClientSize.Width - 50), at.Y + box.LineHeight + 4);
+            tip.HideFrom(box);
+            tipStart = s; tipEnd = e; tipVersion = textVersion; tipText = text;
+            if (text != null) tip.ShowNear(text, box, pt);
         }
 
         void HideTip()
         {
             if (tipStart == -2) return;
-            tipStart = -2;
-            tip.Hide(box);
+            tipStart = -2; tipEnd = 0; tipVersion = -1; tipText = null;
+            lastMouse = new Point(-1, -1);
+            tip.HideFrom(box);
         }
 
         // ---------- 复制 / 粘贴 ----------
@@ -1057,7 +1164,7 @@ namespace JsonRightClick
             return false;
         }
 
-        void Cut() { if (masked) { MaskedHint(); return; } if (CopySelection()) box.SelectedText = ""; }
+        void Cut() { if (masked) { MaskedHint(); return; } if (CopySelection()) { box.PrepareFoldEdit(); box.SelectedText = ""; } }
 
         void PastePlain()
         {
@@ -1065,6 +1172,7 @@ namespace JsonRightClick
             string t = ClipboardUtil.GetText();
             if (t == null) { ClipboardBusy(); return; }
             if (t.Length == 0) return;
+            box.PrepareFoldEdit();
             // 粘贴进来的文字统一用普通样式，不继承光标处的颜色和缩进；Ctrl+Enter 可重新着色
             box.SelectionColor = Theme.Current.Syntax[2];
             box.SelectionIndent = 0;
@@ -1094,6 +1202,10 @@ namespace JsonRightClick
             {
                 switch (keyData)
                 {
+                    case Keys.Control | Keys.Shift | Keys.OemOpenBrackets: SetFold(true, false); return true;
+                    case Keys.Control | Keys.Shift | Keys.Oem6: SetFold(false, false); return true;
+                    case Keys.Control | Keys.Alt | Keys.OemOpenBrackets: SetFold(true, true); return true;
+                    case Keys.Control | Keys.Alt | Keys.Oem6: SetFold(false, true); return true;
                     case Keys.Control | Keys.Z: Undo(); return true;
                     case Keys.Control | Keys.V:
                     case Keys.Shift | Keys.Insert: PastePlain(); return true;   // 只粘贴纯文本
