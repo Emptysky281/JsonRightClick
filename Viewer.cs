@@ -18,11 +18,12 @@ namespace JsonRightClick
         static readonly float[] Sizes = { 8, 9, 10, 10.5f, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32 };
         const int MaxMatches = 50000;
         const int LargeText = 150000;   // 超过这个长度：先显示纯文字，再按滚动位置给可见区域着色
-        const int ColorBlock = 150;     // 大文件模式每次着色的行数
+        const int ColorBlock = 4096;     // 大文件着色按固定字符块缓存，不受自动换行或窗口宽度影响
 
         readonly CodeBox box = new CodeBox();
         readonly JsonTree tree = new JsonTree();
         readonly SplitContainer split = new SplitContainer();
+        readonly EditorSurface editorSurface = new EditorSurface { Dock = DockStyle.Fill };
         readonly ToolStrip tools;
         readonly StatusStrip bar;
         readonly ToolStripStatusLabel status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
@@ -37,12 +38,15 @@ namespace JsonRightClick
         readonly System.Windows.Forms.Timer matchTimer = new System.Windows.Forms.Timer { Interval = 180 };
         readonly System.Windows.Forms.Timer pathTimer = new System.Windows.Forms.Timer { Interval = 120 };
         readonly System.Windows.Forms.Timer treeTimer = new System.Windows.Forms.Timer { Interval = 600 };
-        readonly System.Windows.Forms.Timer colorTimer = new System.Windows.Forms.Timer { Interval = 40 };
+        readonly System.Windows.Forms.Timer colorTimer = new System.Windows.Forms.Timer { Interval = 120 };
 
         // 大文件模式
-        bool large, largeNoted;
+        bool large, largeNoted, syntaxColoring;
+        SyntaxIndex syntaxIndex;
+        int syntaxVersion = -1;
         List<int[]> largeRanges = new List<int[]>();
         HashSet<int> coloredBlocks = new HashSet<int>();
+        readonly Dictionary<int, int> colorProgress = new Dictionary<int, int>();
         readonly ToolStripMenuItem miDecode = new ToolStripMenuItem(L.T("解码 JWT"));
         readonly ToolStripMenuItem miNested = new ToolStripMenuItem(L.T("在新窗口解析此字符串（嵌套 JSON）"));
         readonly ToolStripMenuItem miPath = new ToolStripMenuItem(L.T("复制此处的 JSON 路径"));
@@ -175,8 +179,11 @@ namespace JsonRightClick
             box.HandleCreated += delegate { WordBreak.Attach(box); };
             box.TextChanged += delegate
             {
-                if (box.FoldingFormatting) return;
+                if (box.FoldingFormatting || syntaxColoring) return;
+                box.StopSmooth();
                 textVersion++;
+                syntaxIndex = null; syntaxVersion = -1;
+                if (!rendering && large) { coloredBlocks.Clear(); colorProgress.Clear(); ScheduleColors(); }
                 bracketIndex = null; bracketVersion = -1;
                 box.ClearBracketMatch();
                 HideTip();
@@ -192,7 +199,7 @@ namespace JsonRightClick
             box.MouseUp += (s, e) =>
             {
                 if (e.Button == MouseButtons.Left && !rendering && box.SelectionLength == 0)
-                    UpdateBrackets(box.GetCharIndexFromPosition(e.Location));
+                    UpdateBrackets(box.CharIndexAt(e.Location));
             };
             box.CtrlWheel += delegate(int delta)
             {
@@ -205,12 +212,18 @@ namespace JsonRightClick
             box.MouseDown += delegate { HideTip(); };
             box.LostFocus += delegate { HideTip(); };
             box.KeyDown += delegate { HideTip(); };
-            box.ViewportChanged += delegate { HideTip(); };
+            box.ViewportChanged += delegate
+            {
+                HideTip();
+                if (large && !syntaxColoring && !rendering) ScheduleColors();
+            };
+            box.VScroll += delegate { HideTip(); };
+            box.HScroll += delegate { HideTip(); };
             box.FoldingChanged += delegate
             {
                 HideTip();
                 if (!rendering) { UpdateBrackets(); pathTimer.Stop(); pathTimer.Start(); }
-                if (large) { coloredBlocks.Clear(); colorTimer.Stop(); colorTimer.Start(); }
+                if (large) { coloredBlocks.Clear(); colorProgress.Clear(); ScheduleColors(); }
             };
             box.Resize += delegate { HideTip(); };
             Deactivate += delegate { HideTip(); };
@@ -219,8 +232,7 @@ namespace JsonRightClick
             pathTimer.Tick += delegate { pathTimer.Stop(); UpdatePath(); };
             treeTimer.Tick += delegate { treeTimer.Stop(); RebuildTree(); };
             colorTimer.Tick += delegate { colorTimer.Stop(); ColorVisible(); };
-            box.VScroll += delegate { if (large) { colorTimer.Stop(); colorTimer.Start(); } };
-            box.Resize += delegate { if (large) { colorTimer.Stop(); colorTimer.Start(); } };
+            box.Resize += delegate { if (large) ScheduleColors(); };
 
             tree.Dock = DockStyle.Fill;
             tree.NodePicked += OnTreePick;
@@ -229,8 +241,9 @@ namespace JsonRightClick
             split.Dock = DockStyle.Fill;
             split.Orientation = Orientation.Vertical;
             split.SplitterWidth = 5;
-            split.Panel1.Controls.Add(box);
-            split.Panel1.Controls.Add(box.FoldingGutter);
+            editorSurface.Controls.Add(box);
+            editorSurface.Controls.Add(box.FoldingGutter);
+            split.Panel1.Controls.Add(editorSurface);
             split.Panel2.Controls.Add(tree);
             split.Panel2Collapsed = true;
             split.Panel2MinSize = 120;
@@ -511,7 +524,7 @@ namespace JsonRightClick
             tools.ForeColor = bar.ForeColor = th.BarFore;
             BackColor = th.Bar;
             split.BackColor = th.Border;
-            split.Panel1.BackColor = split.Panel2.BackColor = th.Back;
+            editorSurface.BackColor = split.Panel1.BackColor = split.Panel2.BackColor = th.Back;
             box.BackColor = th.Back;
             box.HighlightColor = th.Highlight;
             if (box.ContextMenuStrip != null) ApplyRenderer(box.ContextMenuStrip);
@@ -560,7 +573,7 @@ namespace JsonRightClick
         void ReplaceDisplay(string text)
         {
             int selStart = box.SelectionStart, selLen = box.SelectionLength;
-            int firstChar = box.GetCharIndexFromPosition(new Point(1, 1));
+            int firstChar = box.CharIndexAt(new Point(1, 1));
             bool keepEdited = edited;
             SetContent(text, JsonTools.FindJsonRanges(text));
             rendering = true;
@@ -568,7 +581,7 @@ namespace JsonRightClick
             {
                 int fc = Math.Min(firstChar, box.TextLength);
                 box.Select(fc, 0);
-                var top = box.GetPositionFromCharIndex(fc);
+                var top = box.CharPosition(fc);
                 var p = box.ScrollPos;
                 box.ScrollPos = new Point(p.X, Math.Max(0, p.Y + top.Y));
                 var keep = box.ScrollPos;
@@ -592,7 +605,8 @@ namespace JsonRightClick
                 box.ForeColor = th.Syntax[1];
                 large = text.Length > LargeText;
                 largeNoted = false;
-                coloredBlocks.Clear();
+                coloredBlocks.Clear(); colorProgress.Clear();
+                box.RefreshEditorMetrics();
                 if (!large) box.Rtf = Rtf.Build(text, ranges, th, ViewSettings.FontName, ViewSettings.FontSize);
                 else
                 {
@@ -610,66 +624,65 @@ namespace JsonRightClick
             UpdateBrackets();
         }
 
-        /// <summary>大文件模式：给当前可见区域（及上下各一块）着色，已着色的块不重复处理</summary>
+        void ScheduleColors(int delay = 120)
+        {
+            colorTimer.Stop(); colorTimer.Interval = delay; colorTimer.Start();
+        }
+
+        /// <summary>滚动时不改颜色；空闲时按约 6ms 时间片补色，不移动选区或使结构缓存失效。</summary>
         void ColorVisible()
         {
-            if (!large || !box.IsHandleCreated || box.TextLength == 0) return;
-            int topLine = box.GetLineFromCharIndex(box.GetCharIndexFromPosition(new Point(1, 1)));
-            int botLine = box.GetLineFromCharIndex(box.GetCharIndexFromPosition(new Point(1, box.ClientSize.Height - 1)));
-            int b0 = Math.Max(0, topLine / ColorBlock - 1), b1 = botLine / ColorBlock + 1;
-            var todo = new List<int>();
-            for (int b = b0; b <= b1; b++) if (!coloredBlocks.Contains(b)) todo.Add(b);
-            if (todo.Count == 0) return;
-
+            if (!large || !box.IsHandleCreated || box.DocumentLength == 0 || syntaxColoring) return;
+            if (box.IsSmoothScrolling) { ScheduleColors(); return; }
+            string text = BoxText;
+            if (syntaxIndex == null || syntaxVersion != textVersion)
+            {
+                // 当前文本已归一化为 LF，词法索引不能沿用加载前的 CRLF 位置。
+                largeRanges = JsonTools.FindJsonRanges(text);
+                syntaxIndex = new SyntaxIndex(text, largeRanges);
+                syntaxVersion = textVersion;
+            }
+            int top = box.CharIndexAt(Point.Empty);
+            int bottom = box.CharIndexAt(new Point(Math.Max(0, box.ClientSize.Width - 1), Math.Max(0, box.ClientSize.Height - 1)));
+            var candidates = new List<int>(); var seen = new HashSet<int>();
+            Action<int, int> addBlocks = (start, length) =>
+            {
+                int last = (start + length - 1) / ColorBlock;
+                for (int block = start / ColorBlock; block <= last; block++)
+                    if (!coloredBlocks.Contains(block) && seen.Add(block)) candidates.Add(block);
+            };
+            // 可见内容优先，上下预取其次；折叠块中间可能有数 MB 字符，不应逐块遍历。
+            box.Folding.EachVisibleRange(top, bottom - top + 1, addBlocks);
+            int from = Math.Max(0, top - ColorBlock), to = Math.Min(text.Length, bottom + ColorBlock + 1);
+            box.Folding.EachVisibleRange(from, to - from, addBlocks);
+            if (candidates.Count == 0) return;
+            bool modified = box.Modified;
             var th = Theme.Current;
-            string t = BoxText;
-            bool hadUndo = box.CanUndo;
-            int selStart = box.SelectionStart, selLen = box.SelectionLength;
-            int firstVisible = (int)Native.SendMessage(box.Handle, 0x00CE /* EM_GETFIRSTVISIBLELINE */, IntPtr.Zero, IntPtr.Zero);
-            rendering = true;
-            Native.SendMessage(box.Handle, 0x000B /* WM_SETREDRAW */, IntPtr.Zero, IntPtr.Zero);
+            syntaxColoring = true;
             try
             {
-                using (var undo = RichEditFold.UndoScope(box.Handle))
+                using (var colors = RichEditFold.Colors(box))
                 {
-                    foreach (int b in todo)
+                    var budget = Stopwatch.StartNew();
+                    foreach (int block in candidates)
                     {
-                        coloredBlocks.Add(b);
-                        int s = box.GetFirstCharIndexFromLine(b * ColorBlock);
-                        if (s < 0) continue;
-                        int e = box.GetFirstCharIndexFromLine((b + 1) * ColorBlock);
-                        if (e < 0) e = t.Length;
-                        foreach (var r in largeRanges)
+                        int start; if (!colorProgress.TryGetValue(block, out start)) start = block * ColorBlock;
+                        int end = Math.Min(text.Length, (block + 1) * ColorBlock);
+                        int reached = syntaxIndex.VisitUntil(start, end, (i, length, color) =>
                         {
-                            int rs = Math.Max(s, r[0]), re = Math.Min(e, r[0] + r[1]);
-                            if (rs >= re) continue;
-                            // 从行首开始切分，保证不会从字符串中间开始
-                            int ls = t.LastIndexOf('\n', Math.Max(0, rs - 1)) + 1;
-                            if (ls < r[0]) ls = r[0];
-                            Rtf.Tokenize(t, ls, re, (i, n, c) =>
-                            {
-                                if (c == 1 || i + n <= rs) return;
-                                box.Folding.EachVisibleRange(i, n, (start, length) =>
-                                {
-                                    box.Select(start, length);
-                                    box.SelectionColor = th.Syntax[c];
-                                });
-                            });
-                        }
+                            box.Folding.EachVisibleRange(i, length, (s, count) => colors.Set(s, count, th.Syntax[color]));
+                            return budget.ElapsedMilliseconds < 6;
+                        });
+                        if (reached >= end) { coloredBlocks.Add(block); colorProgress.Remove(block); }
+                        else { colorProgress[block] = reached; break; }
+                        if (budget.ElapsedMilliseconds >= 6) break;
                     }
-                    box.Select(selStart, selLen);
-                    int nowFirst = (int)Native.SendMessage(box.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
-                    if (nowFirst != firstVisible) Native.SendMessage(box.Handle, 0x00B6 /* EM_LINESCROLL */, IntPtr.Zero, (IntPtr)(firstVisible - nowFirst));
                 }
             }
-            finally
-            {
-                Native.SendMessage(box.Handle, 0x000B, (IntPtr)1, IntPtr.Zero);
-                rendering = false;
-                box.Invalidate();
-            }
-            if (!hadUndo) box.ClearUndo(); // 着色不算编辑；已有编辑时保留撤销记录
-            UpdateBrackets();
+            finally { box.Modified = modified; syntaxColoring = false; }
+            box.Invalidate();
+            foreach (int block in candidates)
+                if (!coloredBlocks.Contains(block)) { ScheduleColors(16); break; }
         }
 
         void AddFoldingMenu(ToolStripItemCollection items, bool context = false)
@@ -726,7 +739,7 @@ namespace JsonRightClick
             m.Opening += delegate
             {
                 var pt = box.PointToClient(Cursor.Position);
-                menuIndex = box.GetCharIndexFromPosition(pt);
+                menuIndex = box.CharIndexAt(pt);
                 int s, e;
                 string val;
                 string kind = TokenAt(menuIndex, out s, out e, out val);
@@ -959,7 +972,7 @@ namespace JsonRightClick
         {
             box.StopSmooth();
             box.RevealRange(charIndex, 0);
-            int y = box.GetPositionFromCharIndex(charIndex).Y;
+            int y = box.CharPosition(charIndex).Y;
             if (y >= 0 && y < box.ClientSize.Height - 40) return; // 已经在可见区域
             var p = box.ScrollPos;
             box.ScrollPos = new Point(p.X, Math.Max(0, p.Y + y - box.ClientSize.Height / 3));
@@ -1104,8 +1117,8 @@ namespace JsonRightClick
         void HoverAt(Point pt)
         {
             if (BoxText.Length == 0 || box.IsFoldPlaceholder(pt)) { HideTip(); return; }
-            int idx = box.GetCharIndexFromPosition(pt);
-            var cp = box.GetPositionFromCharIndex(idx);
+            int idx = box.CharIndexAt(pt);
+            var cp = box.CharPosition(idx);
             if (Math.Abs(cp.Y + box.LineHeight / 2 - pt.Y) > box.LineHeight || Math.Abs(cp.X - pt.X) > 40) { HideTip(); return; }
             // 同一段长字符串内移动时复用解析结果，但每次都跟随鼠标更新提示位置。
             if (tipVersion == textVersion && idx >= tipStart && idx < tipEnd)

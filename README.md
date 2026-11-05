@@ -16,11 +16,20 @@
 - **资源管理器右键菜单**：右键 .log / .json / .txt 等文件「用 JSON 解析助手打开」。Win11 下可放在第一层菜单（需开发人员模式），也可用经典菜单。
 - **混合文本**：从日志里提取多段 JSON，非 JSON 内容原样保留；「只看 JSON」模式下的修改会合并回全文。
 - **查看工具**：树形视图、JSON 路径、全部匹配高亮搜索（支持正则 / 大小写）、敏感字段打码、JWT 解码、时间戳提示、展开嵌套 JSON 字符串、宽松解析（单引号、尾逗号、注释、Python 字面量）、压缩 / 格式化。
-- **括号配对**：点击 `{` / `}` / `[` / `]`，或用方向键把光标移到括号旁，会同时高亮对应的一对括号；另一端超出可视区域时，编辑区顶部或底部显示对应行预览，点击预览即可跳转。展开嵌套、压缩、撤销、只看 JSON、打码及大文件模式下均可使用；字符串内的括号不会误匹配。
+- **括号配对**：点击 `{` / `}` / `[` / `]`，或用方向键把光标移到括号旁，会同时高亮对应的一对括号，并在左侧折叠栏及文本缩进处显示该层级的竖向范围线；括号在屏幕外时范围线会裁剪到可见区域。另一端超出可视区域时，编辑区顶部或底部显示对应行预览，点击预览即可跳转。展开嵌套、压缩、撤销、只看 JSON、打码及大文件模式下均可使用；字符串内的括号不会误匹配。
 - **代码折叠**：编辑区左侧点击 `− / +` 手动折叠或展开对象 / 数组；收起后点击 `{…}` / `[…]` 可展开。工具栏「折叠」及右键「代码折叠」支持当前层级、全部折叠 / 展开；子层级的独立折叠状态会保留。折叠只改变显示，复制、格式化和撤销使用的仍是完整原文，搜索或树形定位会自动展开目标。
 - **悬停提示**：嵌套 JSON 字符串、JWT、时间戳的提示跟随鼠标，在同一段长文本内移动也会更新位置；靠近屏幕边缘自动调整，滚动、编辑或离开编辑区后隐藏。
 - **界面**：深色 / 浅色主题、导入字体（保存在程序目录 `Fonts\`）、字号记忆、中英文切换、开机自启。
 - 单个 exe，只依赖 Windows 自带的 .NET Framework 4.x，**不联网**。
+
+### 滚动与大文本性能
+
+- 滚动期间不移动光标或反复着色；停下后按约 6 ms 的小时间片补色，优先处理可见内容。
+- 词法结果、字体尺寸与文档长度复用缓存，纯着色不会使搜索、DOM 或括号缓存失效。
+- 长搜索匹配只计算屏幕内的显示行；编辑区与侧栏合成呈现以减少闪烁。
+- 超长文件也按真实像素平滑滚动，不再退回整行跳动；首个小位移在滚轮输入时立即发生，反向输入会立刻反向。
+- 根据屏幕刷新率选择约 7–16 ms 的帧间隔，UI 忙时只保留一个待处理帧，避免累积拖尾。滚动条、键盘、失焦或窗口关闭会取消动画。
+- 折叠、复制、撤销及敏感字段打码的语义不变。
 
 ### 折叠快捷键
 
@@ -89,6 +98,14 @@ JsonRightClick.exe --uitest samples\sample.log out.txt
 
 测试产物位于 `.test-output/`，覆盖括号匹配、代码折叠与父子状态、折叠复制及撤销、搜索 / 树形定位、嵌套展开、视图切换、长文本提示定位、屏幕边界和大文件着色；不改写现有程序的显示设置。
 
+滚动性能基准（可选，用同一份 5000 条嵌套记录及 12.5 万字符搜索匹配对比本地旧提交）：
+
+```powershell
+.\tests\run-scroll-benchmark.ps1 -BaselineRef 71369dc
+```
+
+基准会确认文档确实滚动，报告补色总耗时 / 最长时间片、选区事件数、滚动帧 P50 / P95 和长匹配重绘耗时。结果写入 `.test-output/`；不同机器、字体和文档的结果会有差异。
+
 ## License
 
 [MIT](LICENSE)
@@ -104,6 +121,8 @@ JsonRightClick.exe --uitest samples\sample.log out.txt
 - Keeps non-JSON text intact; edits made in *JSON only* mode are merged back.
 - Tree view, JSON path, highlight-all search with regex, sensitive-field masking, JWT decoding, timestamp hints, nested-JSON expansion, lenient parsing.
 - Matching-bracket highlights, with a clickable line preview when the other bracket is off screen; works after expanding nested JSON strings.
+- Scope guides connect matching brackets in the left gutter and indentation area, clipped to the visible viewport.
+- Cached native layout and tokenization, budgeted non-selection coloring, and viewport-bounded search highlights reduce scrolling stalls and text flicker.
 - IDEA-style code folding with a left gutter, clickable placeholders, current/all-level menu actions and keyboard shortcuts; the complete source text and editing undo history are retained.
 - Hover hints follow the pointer, including within very long wrapped strings, and stay within the screen.
 - Dark / light theme, custom fonts, remembered font size, Chinese / English UI, start with Windows.

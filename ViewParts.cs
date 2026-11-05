@@ -250,16 +250,21 @@ namespace JsonRightClick
     // ===================== 平滑滚动的编辑框 =====================
     /// <summary>
     /// RichTextBox 默认每格滚轮直接跳 3 行，显得一顿一顿的。这里接管滚轮：
-    /// 累计目标位置，用约 8ms 一帧的缓动动画逐像素滚过去；快速连续滚动时速度会叠加。
+    /// 累计目标位置，按屏幕刷新率逐像素缓动；快速连续滚动时速度会叠加。
     /// </summary>
     sealed partial class CodeBox : RichTextBox
     {
         public event Action<int> CtrlWheel;
-        readonly System.Windows.Forms.Timer anim = new System.Windows.Forms.Timer { Interval = 8 };
+        readonly AnimationFramePump anim = new AnimationFramePump();
         readonly Stopwatch clock = new Stopwatch();
         double target, current;
-        bool animating;
-        int lineAcc;
+        bool animating, viewportKnown;
+        double pixelRemainder;
+        int wheelDirection;
+        internal int AnimationInterval { get; private set; }
+        Point lastScroll;
+        int lastFirstLine;
+        public bool IsSmoothScrolling { get { return animating; } }
 
         /// <summary>搜索结果高亮：[起点, 长度]，按起点排序。当前选中的那个由系统选区颜色显示。</summary>
         public List<int[]> Highlights = new List<int[]>();
@@ -271,63 +276,74 @@ namespace JsonRightClick
         public int BracketOpen { get { return bracketOpen; } }
         public int BracketClose { get { return bracketClose; } }
         static float dpi;
+        int editorLineHeight, editorCharacterWidth;
+        float editorFontSize;
+        internal float RenderFontSize { get { EnsureEditorMetrics(); return editorFontSize; } }
 
         public CodeBox()
         {
-            anim.Tick += delegate { Step(); };
             folding = new CodeFolding(this);
         }
 
-        // 在 RichEdit 自己绘制完后，只在本次重绘区域内叠加半透明高亮，不改动文字格式（不影响撤销）
+        // 只按屏幕内的显示行计算搜索框；长匹配不能逐字符扫描到文档末尾。
+        internal List<Rectangle> HighlightRectangles(Rectangle clip)
+        {
+            var result = new List<Rectangle>();
+            clip = Rectangle.Intersect(ClientRectangle, clip);
+            if (Highlights.Count == 0 || clip.Width <= 0 || clip.Height <= 0) return result;
+            int first = CharIndexAt(new Point(0, Math.Max(0, clip.Top)));
+            int last = CharIndexAt(new Point(ClientSize.Width, Math.Min(ClientSize.Height - 1, clip.Bottom)));
+            int from = GetFirstCharIndexFromLine(Math.Max(0, GetLineFromCharIndex(first) - 1));
+            int to = GetFirstCharIndexFromLine(GetLineFromCharIndex(last) + 2);
+            if (from < 0) from = 0;
+            if (to < 0) to = DocumentLength;
+            int lo = 0, hi = Highlights.Count;
+            while (lo < hi) { int mid = (lo + hi) / 2; if (Highlights[mid][0] + Highlights[mid][1] <= from) lo = mid + 1; else hi = mid; }
+            int selected = SelectionStart, selectedLength = SelectionLength, height = LineHeight, width = CharacterWidth;
+            for (int k = lo; k < Highlights.Count && Highlights[k][0] < to; k++)
+            {
+                int start = Highlights[k][0], length = Highlights[k][1];
+                if (start == selected && length == selectedLength) continue;
+                int end = Math.Min(to, start + length), at = Math.Max(from, start);
+                while (at < end)
+                {
+                    int visible = folding.SkipHidden(at);
+                    if (visible != at) { at = Math.Min(end, visible); continue; }
+                    int line = GetLineFromCharIndex(at), next = GetFirstCharIndexFromLine(line + 1);
+                    int stop = next > at ? Math.Min(end, next) : end;
+                    folding.EachVisibleRange(at, stop - at, (i, count) =>
+                    {
+                        Point a = CharPosition(i), z = CharPosition(i + count - 1);
+                        int right = z.X + width;
+                        if (i + count < DocumentLength && GetLineFromCharIndex(i + count) == line) right = CharPosition(i + count).X;
+                        var r = Rectangle.Intersect(clip, new Rectangle(a.X, a.Y, Math.Max(2, right - a.X), height));
+                        if (r.Width > 0 && r.Height > 0) result.Add(r);
+                    });
+                    at = stop;
+                }
+            }
+            return result;
+        }
+
+        void EnsureEditorMetrics() { if (editorLineHeight == 0) RefreshEditorMetrics(); }
+        internal void RefreshEditorMetrics()
+        {
+            string name = ViewSettings.FontName;
+            editorFontSize = ViewSettings.FontSize;
+            if (dpi == 0) using (var graphics = Graphics.FromHwnd(IntPtr.Zero)) dpi = graphics.DpiX;
+            editorLineHeight = Math.Max(8, (int)Math.Round(Native.FontLineHeight(name, editorFontSize)));
+            editorCharacterWidth = Math.Max(4, (int)Math.Round(Native.FontCharWidthTwips(name, editorFontSize) * dpi / 1440f));
+        }
+        internal int CharacterWidth { get { EnsureEditorMetrics(); return editorCharacterWidth; } }
+
         void PaintHighlights(Region clip)
         {
             if (Highlights.Count == 0) return;
-            Rectangle cb;
-            using (var graphics = Graphics.FromHwnd(Handle)) cb = Rectangle.Round(clip.GetBounds(graphics));
-            if (cb.Width <= 0 || cb.Height <= 0) return;
-            int a = GetCharIndexFromPosition(new Point(0, Math.Max(0, cb.Top)));
-            int lineA = GetLineFromCharIndex(a);
-            int from = GetFirstCharIndexFromLine(Math.Max(0, lineA - 1));
-            int b = GetCharIndexFromPosition(new Point(ClientSize.Width, Math.Min(ClientSize.Height - 1, cb.Bottom)));
-            int lineB = GetLineFromCharIndex(b);
-            int to = GetFirstCharIndexFromLine(lineB + 2);
-            if (to < 0) to = TextLength;
-            if (from < 0) from = 0;
-
-            int lo = 0, hi = Highlights.Count;
-            while (lo < hi) { int mid = (lo + hi) / 2; if (Highlights[mid][0] + Highlights[mid][1] < from) lo = mid + 1; else hi = mid; }
-
-            if (dpi == 0) using (var g0 = Graphics.FromHwnd(IntPtr.Zero)) dpi = g0.DpiX;
-            int cw = Math.Max(4, (int)Math.Round(Native.FontCharWidthTwips(ViewSettings.FontName, ViewSettings.FontSize) * dpi / 1440f));
-            int lh = LineHeight;
-            int sel = SelectionStart, selLen = SelectionLength;
-
             using (var g = Graphics.FromHwnd(Handle))
-            using (var br = new SolidBrush(HighlightColor))
+            using (var brush = new SolidBrush(HighlightColor))
             {
                 g.SetClip(clip, CombineMode.Replace);
-                for (int k = lo; k < Highlights.Count && Highlights[k][0] <= to; k++)
-                {
-                    int s = Highlights[k][0], e = s + Highlights[k][1];
-                    if (s == sel && Highlights[k][1] == selLen) continue; // 当前项用系统选区色
-                    int i = s;
-                    while (i < e)
-                    {
-                        int visible = folding.SkipHidden(i);
-                        if (visible != i) { i = Math.Min(e, visible); continue; }
-                        var p0 = GetPositionFromCharIndex(i);
-                        int line = GetLineFromCharIndex(i);
-                        int j = i + 1;
-                        while (j < e && !folding.IsHidden(j) && GetLineFromCharIndex(j) == line) j++;
-                        int x1;
-                        var pe = GetPositionFromCharIndex(j - 1);
-                        x1 = pe.X + cw;
-                        if (j < TextLength && j < e) { } else if (j < TextLength && GetLineFromCharIndex(j) == line) x1 = GetPositionFromCharIndex(j).X;
-                        if (p0.Y + lh >= 0 && p0.Y <= ClientSize.Height)
-                            g.FillRectangle(br, p0.X, p0.Y, Math.Max(2, x1 - p0.X), lh);
-                        i = j;
-                    }
-                }
+                foreach (var bounds in HighlightRectangles(Rectangle.Round(clip.GetBounds(g)))) g.FillRectangle(brush, bounds);
             }
         }
 
@@ -338,23 +354,22 @@ namespace JsonRightClick
             bracketOpen = open; bracketClose = close; bracketAnchor = anchor;
             openContext = first; closeContext = last;
             Invalidate();
+            if (folding != null) folding.Refresh();
         }
 
         public void ClearBracketMatch() { SetBracketMatch(-1, -1, -1, null, null); }
 
         Rectangle BracketRectangle(int index)
         {
-            Point p = GetPositionFromCharIndex(index), next = GetPositionFromCharIndex(index + 1);
-            if (dpi == 0) using (var g = Graphics.FromHwnd(IntPtr.Zero)) dpi = g.DpiX;
-            int width = next.Y == p.Y && next.X > p.X ? next.X - p.X :
-                Math.Max(4, (int)Math.Round(Native.FontCharWidthTwips(ViewSettings.FontName, ViewSettings.FontSize) * dpi / 1440f));
+            Point p = CharPosition(index), next = CharPosition(index + 1);
+            int width = next.Y == p.Y && next.X > p.X ? next.X - p.X : CharacterWidth;
             return new Rectangle(p.X - 1, p.Y, width + 2, LineHeight);
         }
 
         internal bool TryGetBracketPreview(out int target, out Rectangle bounds, out string text)
         {
             target = -1; bounds = Rectangle.Empty; text = null;
-            if (bracketOpen < 0 || bracketClose >= TextLength || ClientSize.Width < 90 || ClientSize.Height < 80) return false;
+            if (bracketOpen < 0 || bracketClose >= DocumentLength || ClientSize.Width < 90 || ClientSize.Height < 80) return false;
             target = bracketAnchor == bracketOpen ? bracketClose : bracketOpen;
             Rectangle at = BracketRectangle(target);
             if (ClientRectangle.Contains(at)) return false;
@@ -366,15 +381,49 @@ namespace JsonRightClick
             return true;
         }
 
+        internal struct ScopeGuide
+        {
+            public int X, Top, Bottom, OpenY, CloseY, TextTop, TextBottom;
+        }
+        internal bool TryGetScopeGuide(out ScopeGuide guide)
+        {
+            guide = new ScopeGuide();
+            if (bracketOpen < 0 || bracketClose >= DocumentLength || folding.IsHidden(bracketOpen) || folding.IsHidden(bracketClose)) return false;
+            Point a = CharPosition(bracketOpen), b = CharPosition(bracketClose);
+            if (b.Y <= a.Y) return false; // 同行或已折叠的括号没有纵向范围。
+            int height = LineHeight;
+            guide.OpenY = a.Y + height / 2; guide.CloseY = b.Y + height / 2;
+            guide.Top = Math.Max(0, guide.OpenY); guide.Bottom = Math.Min(ClientSize.Height - 1, guide.CloseY);
+            int left = Math.Min(a.X, b.X);
+            guide.X = left >= 0 ? Math.Max(1, left - CharacterWidth / 2) : left - CharacterWidth / 2;
+            guide.TextTop = Math.Max(0, a.Y + height); guide.TextBottom = Math.Min(ClientSize.Height - 1, b.Y);
+            return guide.Bottom >= guide.Top && ClientSize.Height > 0;
+        }
+        internal void PaintGutterScopeGuide(Graphics graphics, int width)
+        {
+            ScopeGuide guide;
+            if (!TryGetScopeGuide(out guide)) return;
+            int x = width - 3;
+            using (var pen = new Pen(Theme.Current.Accent, 1.5f))
+            {
+                graphics.DrawLine(pen, x, guide.Top, x, guide.Bottom);
+                if (guide.OpenY >= 0 && guide.OpenY < ClientSize.Height) graphics.DrawLine(pen, x - 5, guide.OpenY, x, guide.OpenY);
+                if (guide.CloseY >= 0 && guide.CloseY < ClientSize.Height) graphics.DrawLine(pen, x - 5, guide.CloseY, x, guide.CloseY);
+            }
+        }
+
         void PaintBrackets(Region clip)
         {
-            if (bracketOpen < 0 || bracketClose >= TextLength) return;
+            if (bracketOpen < 0 || bracketClose >= DocumentLength) return;
             var th = Theme.Current;
             using (var g = Graphics.FromHwnd(Handle))
             using (var fill = new SolidBrush(Color.FromArgb(th.Dark ? 85 : 55, th.Accent)))
             using (var pen = new Pen(th.Accent))
             {
                 g.SetClip(clip, CombineMode.Replace);
+                ScopeGuide guide;
+                if (TryGetScopeGuide(out guide) && guide.X >= 0 && guide.X < ClientSize.Width && guide.TextBottom > guide.TextTop)
+                    using (var line = new Pen(Color.FromArgb(150, th.Accent), 1f)) g.DrawLine(line, guide.X, guide.TextTop, guide.X, guide.TextBottom);
                 foreach (int index in new[] { bracketOpen, bracketClose })
                 {
                     if (folding.IsHidden(index)) continue;
@@ -397,6 +446,11 @@ namespace JsonRightClick
 
         void OnViewportChanged()
         {
+            if (!IsHandleCreated || IsDisposed) return;
+            Point position = ScrollPos;
+            int first = (int)Native.SendMessage(Handle, 0x00CE /* EM_GETFIRSTVISIBLELINE */, IntPtr.Zero, IntPtr.Zero);
+            if (viewportKnown && position == lastScroll && first == lastFirstLine) return;
+            viewportKnown = true; lastScroll = position; lastFirstLine = first;
             if (Highlights.Count > 0 || bracketOpen >= 0 || (folding != null && folding.CollapsedCount > 0)) Invalidate();
             var handler = ViewportChanged;
             if (handler != null) handler();
@@ -404,24 +458,33 @@ namespace JsonRightClick
 
         protected override void OnVScroll(EventArgs e) { base.OnVScroll(e); OnViewportChanged(); }
         protected override void OnHScroll(EventArgs e) { base.OnHScroll(e); OnViewportChanged(); }
+        protected override void OnResize(EventArgs e) { StopSmooth(); viewportKnown = false; base.OnResize(e); }
+        protected override void OnHandleDestroyed(EventArgs e) { StopSmooth(); base.OnHandleDestroyed(e); }
+        protected override void OnLostFocus(EventArgs e) { StopSmooth(); base.OnLostFocus(e); }
 
         public Point ScrollPos
         {
-            get { var p = new Native.POINT(); Native.SendMessage(Handle, 0x04DD /* EM_GETSCROLLPOS */, IntPtr.Zero, ref p); return new Point(p.X, p.Y); }
-            set { var p = new Native.POINT { X = value.X, Y = value.Y }; Native.SendMessage(Handle, 0x04DE /* EM_SETSCROLLPOS */, IntPtr.Zero, ref p); OnViewportChanged(); }
+            get { return ReadPixelScrollPosition(); }
+            set
+            {
+                if (value == ScrollPos) return;
+                var p = new Native.POINT { X = value.X, Y = value.Y };
+                Native.SendMessage(Handle, 0x04DE /* EM_SETSCROLLPOS */, IntPtr.Zero, ref p);
+                OnViewportChanged();
+            }
         }
 
-        int MaxScroll(out bool ok)
-        {
-            var si = new Native.SCROLLINFO { cbSize = (uint)Marshal.SizeOf(typeof(Native.SCROLLINFO)), fMask = 0x17 /* SIF_ALL */ };
-            ok = Native.GetScrollInfo(Handle, 1 /* SB_VERT */, ref si);
-            return Math.Max(0, si.nMax - Math.Max(0, (int)si.nPage - 1));
-        }
+        int MaxScroll(out bool ok) { return VerticalPixelLimit(out ok); }
 
-        public int LineHeight { get { return Math.Max(8, (int)Math.Round(Native.FontLineHeight(ViewSettings.FontName, ViewSettings.FontSize))); } }
+        public int LineHeight { get { EnsureEditorMetrics(); return editorLineHeight; } }
 
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == AnimationFramePump.MessageId)
+            {
+                if (anim.Accept(m.WParam) && animating) Step();
+                return;
+            }
             if (HandleFoldingMessage(ref m)) return;
             switch (m.Msg)
             {
@@ -458,6 +521,8 @@ namespace JsonRightClick
                 case 0x0202: // WM_LBUTTONUP
                     if (previewJumped) { previewJumped = false; return; }
                     break;
+                case 0x00A1: // WM_NCLBUTTONDOWN：开始操作原生滚动条时立即取消惯性。
+                case 0x020E: // WM_MOUSEHWHEEL
                 case 0x0115: // WM_VSCROLL：拖动滚动条等，停止动画
                 case 0x0114: // WM_HSCROLL
                 case 0x0100: // WM_KEYDOWN
@@ -467,53 +532,87 @@ namespace JsonRightClick
             base.WndProc(ref m);
         }
 
+        [DllImport("gdi32.dll")]
+        static extern int GetDeviceCaps(IntPtr context, int index);
+        int FrameInterval()
+        {
+            int refresh = 60;
+            using (var graphics = CreateGraphics())
+            {
+                IntPtr context = graphics.GetHdc();
+                try { int reported = GetDeviceCaps(context, 116 /* VREFRESH */); if (reported >= 30 && reported <= 360) refresh = reported; }
+                finally { graphics.ReleaseHdc(context); }
+            }
+            return Math.Max(7, Math.Min(16, (int)Math.Round(1000.0 / Math.Min(144, refresh))));
+        }
+
         bool Wheel(int delta)
         {
             bool ok;
-            int max = MaxScroll(out ok);
+            int maximum = MaxScroll(out ok);
             if (!ok) return false;
-            if (max <= 0) return true;
+            if (maximum <= 0 || delta == 0) return true;
             int lines = SystemInformation.MouseWheelScrollLines;
-            if (lines <= 0) lines = 3;
-
-            // 文档极长时 EM_SETSCROLLPOS 只有 16 位，改为按行平滑滚动
-            if (max > 60000)
+            if (lines == 0) return true;
+            if (lines < 0) lines = Math.Max(1, ClientSize.Height / LineHeight - 1);
+            double distance = -delta / 120.0 * lines * LineHeight;
+            int direction = Math.Sign(distance);
+            Point actual = ScrollPos;
+            bool starting = !animating;
+            if (starting) { current = actual.Y; target = current + pixelRemainder; }
+            // 反向输入立即丢掉旧方向的排队距离，不再先往错误方向滑一段。
+            if (wheelDirection != 0 && direction != wheelDirection)
             {
-                lineAcc += -delta * lines;
-                int n = lineAcc / 120;
-                if (n != 0) { lineAcc -= n * 120; Native.SendMessage(Handle, 0x00B6 /* EM_LINESCROLL */, IntPtr.Zero, (IntPtr)n); }
-                return true;
+                current = actual.Y; pixelRemainder = 0;
+                // 对称的上下滚轮应回到原位；只有新目标仍在旧方向时才取消多余排队距离。
+                if ((target + distance - current) * direction < 0) target = current;
             }
-
-            if (!animating) { current = ScrollPos.Y; target = current; }
-            target = Math.Max(0, Math.Min(max, target - delta / 120.0 * lines * LineHeight));
-            if (!animating)
+            wheelDirection = direction;
+            target = Math.Max(0, Math.Min(maximum, target + distance));
+            if (Math.Abs(target - current) < 0.001) { StopSmooth(); return true; }
+            if (starting)
             {
                 animating = true;
+                AnimationInterval = FrameInterval();
                 Native.timeBeginPeriod(1);
                 clock.Restart();
-                anim.Start();
+                anim.Start(Handle, AnimationInterval);
             }
+            // 帧时钟在首次呈现之前启动，不把文字绘制耗时再叠加到下一帧的等待中。
+            double inputStep = starting ? 4 : Math.Max(4, Math.Min(8, clock.Elapsed.TotalMilliseconds));
+            clock.Restart();
+            AdvanceScroll(inputStep);
             return true;
         }
 
         void Step()
         {
-            double dt = Math.Max(1, clock.Elapsed.TotalMilliseconds);
-            clock.Restart();
-            double k = 1 - Math.Exp(-dt / 45.0); // 约 45ms 时间常数，ease-out
-            current += (target - current) * k;
-            if (Math.Abs(target - current) < 0.5) current = target;
-            var p = ScrollPos;
-            ScrollPos = new Point(p.X, (int)Math.Round(current));
+            double elapsed = Math.Max(1, Math.Min(32, clock.Elapsed.TotalMilliseconds));
+            clock.Restart(); AdvanceScroll(elapsed);
+        }
+        void AdvanceScroll(double elapsed)
+        {
+            double response = Math.Abs(target - current) > ClientSize.Height ? 18 : 24;
+            current += (target - current) * (1 - Math.Exp(-elapsed / response));
+            if (Math.Abs(target - current) < 0.25) current = target;
+            Point actual = ScrollPos;
+            int next = (int)Math.Round(current);
+            if (next != actual.Y)
+            {
+                ScrollPos = new Point(actual.X, next);
+                int reached = ScrollPos.Y;
+                if (reached != next) { current = target = reached; pixelRemainder = 0; }
+                // 合并帧消息不允许饿死 WM_PAINT；每帧至多刷新一次文字和对应侧栏。
+                Update();
+                if (!folding.Gutter.IsDisposed) folding.Gutter.Update();
+            }
             if (current == target) StopSmooth();
         }
-
         public void StopSmooth()
         {
             if (!animating) return;
-            animating = false;
-            anim.Stop();
+            pixelRemainder = target - Math.Round(target);
+            animating = false; anim.Stop(); clock.Stop();
             Native.timeEndPeriod(1);
         }
 

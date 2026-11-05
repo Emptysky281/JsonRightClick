@@ -24,12 +24,14 @@ namespace JsonRightClick
         List<FoldRegion> regions = new List<FoldRegion>();
         List<FoldRegion> hidden = new List<FoldRegion>();
         bool changing, nativeHidden;
+        int collapsedCount;
         public event Action Changed;
         public bool Changing { get { return changing; } }
+        public int DocumentLength { get { return source.Length; } }
         public Control Gutter { get { return gutter; } }
         internal List<FoldRegion> Regions { get { return regions; } }
         internal List<FoldRegion> Hidden { get { return hidden; } }
-        public int CollapsedCount { get { int count = 0; foreach (var r in regions) if (r.Collapsed) count++; return count; } }
+        public int CollapsedCount { get { return collapsedCount; } }
 
         public CodeFolding(CodeBox box)
         {
@@ -174,9 +176,13 @@ namespace JsonRightClick
         void Apply()
         {
             var visible = new List<FoldRegion>();
-            int end = -1;
+            int end = -1; collapsedCount = 0;
             foreach (var r in regions)
-                if (r.Collapsed && r.Open > end) { visible.Add(r); end = r.Close; }
+                if (r.Collapsed)
+                {
+                    collapsedCount++;
+                    if (r.Open > end) { visible.Add(r); end = r.Close; }
+                }
             if (nativeHidden || visible.Count > 0)
             {
                 int sel = box.SelectionStart, len = box.SelectionLength;
@@ -207,6 +213,7 @@ namespace JsonRightClick
                 }
             }
             hidden = visible; nativeHidden = hidden.Count > 0;
+            box.Invalidate();
             Refresh();
             var handler = Changed; if (handler != null) handler();
         }
@@ -214,16 +221,16 @@ namespace JsonRightClick
         public Rectangle Placeholder(FoldRegion r)
         {
             if (!r.Collapsed || IsHidden(r.Open)) return Rectangle.Empty;
-            Point a = box.GetPositionFromCharIndex(r.Open), b = box.GetPositionFromCharIndex(r.Close);
+            Point a = box.CharPosition(r.Open), b = box.CharPosition(r.Close);
             if (a.Y != b.Y) return Rectangle.Empty;
-            int width = Math.Max(6, (int)Math.Round(Native.FontCharWidthTwips(ViewSettings.FontName, ViewSettings.FontSize) * box.DeviceDpiForFolding / 1440f));
+            int width = Math.Max(6, box.CharacterWidth);
             return new Rectangle(a.X, a.Y, Math.Max(width * 2, b.X - a.X + width), box.LineHeight);
         }
 
         public FoldRegion PlaceholderAt(Point point)
         {
             if (hidden.Count == 0 || !box.ClientRectangle.Contains(point)) return null;
-            int position = box.GetCharIndexFromPosition(point);
+            int position = box.CharIndexAt(point);
             int lo = 0, hi = hidden.Count - 1;
             while (lo <= hi)
             {
@@ -236,9 +243,9 @@ namespace JsonRightClick
         }
         public IEnumerable<FoldRegion> VisibleRegions()
         {
-            if (!box.IsHandleCreated || box.TextLength == 0) yield break;
-            int top = box.GetCharIndexFromPosition(Point.Empty);
-            int bottom = box.GetCharIndexFromPosition(new Point(box.ClientSize.Width, Math.Max(0, box.ClientSize.Height - 1)));
+            if (!box.IsHandleCreated || source.Length == 0) yield break;
+            int top = box.CharIndexAt(Point.Empty);
+            int bottom = box.CharIndexAt(new Point(box.ClientSize.Width, Math.Max(0, box.ClientSize.Height - 1)));
             int lo = 0, hi = regions.Count;
             while (lo < hi) { int mid = (lo + hi) / 2; if (regions[mid].Open < top) lo = mid + 1; else hi = mid; }
             for (int i = Math.Max(0, lo - 1); i < regions.Count; i++)
@@ -251,7 +258,7 @@ namespace JsonRightClick
                     while (i + 1 < regions.Count && regions[i + 1].Open < next) i++;
                     continue;
                 }
-                Point p = box.GetPositionFromCharIndex(r.Open);
+                Point p = box.CharPosition(r.Open);
                 if (p.Y + box.LineHeight >= 0 && p.Y < box.ClientSize.Height) yield return r;
             }
         }
@@ -263,7 +270,7 @@ namespace JsonRightClick
             using (var g = Graphics.FromHwnd(box.Handle))
             using (var fill = new SolidBrush(th.Checked))
             using (var pen = new Pen(th.Accent))
-            using (var font = new Font("Consolas", Math.Max(5, ViewSettings.FontSize * 0.65f)))
+            using (var font = new Font("Consolas", Math.Max(5, box.RenderFontSize * 0.65f)))
             using (var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center, FormatFlags = StringFormatFlags.NoWrap })
             using (var ink = new SolidBrush(th.BarFore))
             {
@@ -279,7 +286,7 @@ namespace JsonRightClick
                 }
             }
         }
-        public void Refresh() { if (!box.IsDisposed) box.Invalidate(); if (!gutter.IsDisposed) gutter.Invalidate(); }
+        public void Refresh() { if (!gutter.IsDisposed) gutter.Invalidate(); }
         public void Dispose() { box.ViewportChanged -= Refresh; gutter.Dispose(); }
     }
 
@@ -302,12 +309,13 @@ namespace JsonRightClick
             base.OnPaint(e); hits.Clear();
             var th = Theme.Current; e.Graphics.Clear(th.Bar);
             using (var border = new Pen(th.Border)) e.Graphics.DrawLine(border, Width - 1, 0, Width - 1, Height);
+            box.PaintGutterScopeGuide(e.Graphics, Width);
             var rows = new HashSet<int>();
             using (var pen = new Pen(th.Muted))
             using (var fill = new SolidBrush(th.Back))
                 foreach (var r in folding.VisibleRegions())
                 {
-                    int y = box.GetPositionFromCharIndex(r.Open).Y + box.LineHeight / 2;
+                    int y = box.CharPosition(r.Open).Y + box.LineHeight / 2;
                     if (!rows.Add(y)) continue;
                     int size = Math.Max(9, Math.Min(13, box.LineHeight - 2));
                     var bounds = new Rectangle((Width - size) / 2, y - size / 2, size, size);
@@ -377,7 +385,7 @@ namespace JsonRightClick
     }
 
     /// <summary>隐藏格式不写入撤销栈。接口顺序及常量对应 Windows SDK TOM.h / RichEdit.h。</summary>
-    static class RichEditFold
+    static partial class RichEditFold
     {
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         struct CharFormat
@@ -420,10 +428,13 @@ namespace JsonRightClick
             [PreserveSig] int BeginEditCollection();
             [PreserveSig] int EndEditCollection();
             [PreserveSig] int Undo(int count, out int result);
+            [PreserveSig] int Redo(int count, out int result);
+            [PreserveSig] int Range(int start, int end, out ITextRange range);
         }
         sealed class UndoSuspension : IDisposable
         {
             ITextDocument document;
+            public ITextDocument Document { get { return document; } }
             public UndoSuspension(IntPtr handle)
             {
                 IntPtr memory = Marshal.AllocHGlobal(IntPtr.Size), ole = IntPtr.Zero;

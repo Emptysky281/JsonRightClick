@@ -53,6 +53,14 @@ namespace JsonRightClick
                 Run("folding: search and tree navigation reveal hidden targets", FoldingNavigationTests);
                 Run("folding: restyle, nested expansion, minify, JSON-only and mask", FoldingTransformTests);
                 Run("folding: large files and long wrapped values", FoldingLargeTests);
+                Run("rendering: cached native layout matches Framework positions", NativeLayoutTests);
+                Run("rendering: token index clips long strings and supports budget resume", SyntaxIndexTests);
+                Run("rendering: range colors preserve caret, structure cache and undo", StableColoringTests);
+                Run("rendering: long matches visit visible rows only", BoundedHighlightTests);
+                Run("scrolling: real movement, notification dedup and long-file easing", SmoothScrollTests);
+                Run("scope guides: full range, viewport clipping, folding and zoom", ScopeGuideTests);
+                Run("fluid scrolling: high precision, immediate response, reversal and bounded queue", FluidScrollingTests);
+                Run("pixel scrolling: hidden Unicode text, selections and mutation safety", HiddenTextCompatibilityTests);
                 Console.WriteLine("ALL PASSED: " + checks + " assertions");
                 return 0;
             }
@@ -328,7 +336,7 @@ namespace JsonRightClick
                 Check(b.CollapsedCount == 1 && b.Folding.Hidden.Count == 1, "one effective hidden root");
                 Check(b.GetPositionFromCharIndex(close).Y == b.GetPositionFromCharIndex(0).Y && expandedY > b.LineHeight,
                     "hidden newlines really collapse in the native editor layout");
-                Check(b.Text == before && b.TextLength == before.Length, "fold preserves complete document and all source indices");
+                Check(b.Text == before && b.TextLength == before.Length, "fold preserves complete document and all source indices: equal=" + (b.Text == before) + " length=" + b.TextLength + " expected=" + before.Length + " actual=" + b.Text.Length);
                 Check(!b.CanUndo && !(bool)Field(v, "edited") && b.Modified == initialModified, "fold does not create undo entries or edited/modified state: undo=" + b.CanUndo + " edited=" + Field(v, "edited") + " modified=" + b.Modified + " initial=" + initialModified);
                 Check(b.BracketOpen == 0 && b.BracketClose == close, "bracket pair survives collapse");
                 b.SelectAll(); Check(b.SelectedText == before, "select-all/copy source includes all folded text");
@@ -478,6 +486,229 @@ namespace JsonRightClick
                 b.Select(b.TextLength, 0); b.SelectedText = "X";
                 b.Select(0, 0); b.FoldCurrent(true); Call(v, "ColorVisible"); b.FoldAll(false); Call(v, "ColorVisible");
                 b.Undo(); Check(b.Text == full, "large-file coloring while folding never inserts formatting steps into undo");
+            }
+        }
+
+        static void NativeLayoutTests()
+        {
+            string input = "{\"unicode\":\"中文 😀 é \\\"[]{}\\\" " + new string('x', 70000) + "\",\"items\":[{\"n\":1},{\"n\":2}]}";
+            using (var v = Open(input))
+            {
+                var b = Box(v); string text = b.Text;
+                Check(b.DocumentLength == text.Length, "cached render length uses normalized editor indices");
+                var indices = new List<int> { 0, 1, text.IndexOf("中文", StringComparison.Ordinal), text.IndexOf("😀", StringComparison.Ordinal), text.Length - 1, text.Length };
+                for (int i = 0; i < 40; i++) indices.Add((int)((long)i * (text.Length - 1) / 39));
+                foreach (int index in indices) Check(b.CharPosition(index) == b.GetPositionFromCharIndex(index), "native position must match Framework at UTF-16 index " + index);
+                foreach (var point in new[] { Point.Empty, new Point(10, 20), new Point(100, 100), new Point(b.ClientSize.Width - 1, b.ClientSize.Height - 1) })
+                    Check(b.CharIndexAt(point) == b.GetCharIndexFromPosition(point), "native hit testing must match Framework");
+                int array = text.LastIndexOf('['); b.RevealRange(array, 0); b.Select(array, 0); b.FoldCurrent(true);
+                int close = FoldFor(b, array).Close;
+                Check(b.CharPosition(close) == b.GetPositionFromCharIndex(close), "layout remains correct for hidden ranges");
+                b.Select(b.TextLength, 0); b.SelectedText = "\n";
+                Check(b.DocumentLength == b.TextLength, "render length updates after text edit");
+            }
+        }
+        static void SyntaxIndexTests()
+        {
+            string text = "{\n  \"long\": \"" + new string('x', 18000) + "\",\n  \"number\": 123,\n  \"flag\": true\n}";
+            var index = new SyntaxIndex(text, JsonTools.FindJsonRanges(text));
+            int from = text.IndexOf('x') + 12000, to = from + 500, count = 0;
+            index.Visit(from, to, (start, length, color) => { Check(start == from && length == 500 && color == 4, "mid-string blocks keep string color"); count++; });
+            Check(count == 1, "long string indexed as one clipped token, not rescanned characters");
+            int resume = 0, visits = 0;
+            while (resume < text.Length)
+            {
+                int before = resume;
+                resume = index.VisitUntil(resume, text.Length, (start, length, color) => { visits++; return false; });
+                Check(resume > before, "budgeted coloring always makes forward progress");
+            }
+            Check(visits > 5 && visits < 30, "budget can resume without repeating long prefixes");
+            int number = text.IndexOf("123", StringComparison.Ordinal);
+            index.Visit(number, number + 3, (start, length, color) => Check(start == number && length == 3 && color == 5, "number indexed with exact LF offsets"));
+        }
+        static void StableColoringTests()
+        {
+            string input = "{\"n\":123,\"flag\":true,\"word\":\"中文😀\",\"padding\":\"" + new string('x', 160000) + "\"}";
+            using (var v = Open(input))
+            {
+                var b = Box(v); string text = b.Text; b.Select(0, 0); Call(v, "GetDom");
+                object dom = Field(v, "domRoots"), bracket = Field(v, "bracketIndex"); int version = (int)Field(v, "textVersion");
+                int selectionEvents = 0; b.SelectionChanged += delegate { selectionEvents++; };
+                ((HashSet<int>)Field(v, "coloredBlocks")).Clear(); ((Dictionary<int, int>)Field(v, "colorProgress")).Clear();
+                bool modified = b.Modified;
+                for (int i = 0; i < 20; i++) Call(v, "ColorVisible");
+                Check(selectionEvents == 0 && b.SelectionStart == 0 && b.SelectionLength == 0, "syntax coloring never moves caret or selection");
+                Check((int)Field(v, "textVersion") == version, "formatting is not mistaken for text edits");
+                Check(ReferenceEquals(dom, Field(v, "domRoots")) && ReferenceEquals(bracket, Field(v, "bracketIndex")), "scroll coloring keeps structure and bracket caches alive");
+                Check(b.Text == text && b.Modified == modified && !b.CanUndo, "color pass preserves text, modified state and undo");
+                int number = text.IndexOf("123", StringComparison.Ordinal); b.Select(number, 3);
+                Check(b.SelectionColor.ToArgb() == Theme.Current.Syntax[5].ToArgb(), "non-selection native range correctly colors numbers");
+                int word = text.IndexOf("中文", StringComparison.Ordinal); b.Select(word, 2);
+                Check(b.SelectionColor.ToArgb() == Theme.Current.Syntax[4].ToArgb(), "native ranges respect Unicode and normalized newlines");
+                b.ReadOnly = true; int readOnlyEvents = 0; b.ReadOnlyChanged += delegate { readOnlyEvents++; }; ((HashSet<int>)Field(v, "coloredBlocks")).Clear(); ((Dictionary<int, int>)Field(v, "colorProgress")).Clear(); Call(v, "ColorVisible");
+                Check(b.ReadOnly && b.Text == text, "read-only large views can finish pending color slices");
+                Check(readOnlyEvents == 0, "color batches never toggle the public read-only state"); b.ReadOnly = false;
+                b.Select(text.Length, 0); b.SelectedText = "X";
+                int editedVersion = (int)Field(v, "textVersion"); Call(v, "ColorVisible");
+                Check((int)Field(v, "textVersion") == editedVersion, "recoloring after an edit leaves new text version intact");
+                b.Undo(); Check(b.Text == text && b.CanRedo, "coloring never replaces text undo/redo entries");
+                b.Select(0, 0);
+                using (var colors = RichEditFold.Colors(b)) colors.Set(number, 3, Theme.Current.Syntax[5]);
+                Check(b.SelectionStart == 0 && b.SelectionLength == 0, "TOM color application itself does not select the target");
+            }
+        }
+        static void BoundedHighlightTests()
+        {
+            using (var v = Open("{\"long\":\"" + new string('x', 180000) + "\"}"))
+            {
+                var b = Box(v); int start = b.Text.IndexOf('x');
+                b.Highlights = new List<int[]> { new[] { start, 180000 } };
+                Native.SendMessage(b.Handle, 0x00B6, IntPtr.Zero, (IntPtr)500);
+                var watch = Stopwatch.StartNew(); var rectangles = b.HighlightRectangles(b.ClientRectangle); long elapsed = watch.ElapsedMilliseconds;
+                Check(rectangles.Count > 0 && rectangles.Count <= b.ClientSize.Height / b.LineHeight + 4, "long match is bounded by visible display rows");
+                foreach (var rectangle in rectangles) Check(b.ClientRectangle.Contains(rectangle), "no highlight rectangle extends off screen");
+                var clip = new Rectangle(0, b.ClientSize.Height / 3, b.ClientSize.Width, b.ClientSize.Height / 3);
+                foreach (var rectangle in b.HighlightRectangles(clip)) Check(clip.Contains(rectangle), "partial invalidation only repaints clipped rows");
+                Check(elapsed < 500, "visible highlight geometry must not scale with the full long match");
+                Console.WriteLine("  long-match visible geometry: " + elapsed + " ms, " + rectangles.Count + " rows");
+            }
+        }
+        static void SmoothScrollTests()
+        {
+            var json = new StringBuilder("{\"items\":[");
+            for (int i = 0; i < 1800; i++) { if (i > 0) json.Append(','); json.Append("{\"id\":").Append(i).Append(",\"value\":[1,2,3]}"); }
+            json.Append("]}");
+            using (var v = Open(json.ToString()))
+            {
+                var b = Box(v); b.StopSmooth(); Call(b, "OnViewportChanged");
+                int events = 0; b.ViewportChanged += delegate { events++; };
+                b.ScrollPos = b.ScrollPos; Call(b, "OnViewportChanged");
+                Check(events == 0, "unchanged viewport does not issue fake scroll events");
+                int before = (int)Native.SendMessage(b.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
+                Native.SendMessage(b.Handle, 0x00B6, IntPtr.Zero, (IntPtr)3); Call(b, "OnViewportChanged");
+                int after = (int)Native.SendMessage(b.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
+                Check(after > before && events == 1, "real native movement emits exactly one viewport notification");
+                Call(b, "OnViewportChanged"); Check(events == 1, "duplicate native notifications are coalesced");
+                if (SystemInformation.MouseWheelScrollLines != 0)
+                {
+                    before = after; Call(b, "Wheel", -120);
+                    Check(b.IsSmoothScrolling && b.ScrollPos.Y > 0, "very tall files start moving immediately in real pixels");
+                    var timeout = Stopwatch.StartNew();
+                    while (b.IsSmoothScrolling && timeout.ElapsedMilliseconds < 1500) { System.Threading.Thread.Sleep(16); Application.DoEvents(); }
+                    after = (int)Native.SendMessage(b.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
+                    Check(!b.IsSmoothScrolling && after > before, "long-file wheel animation finishes with actual viewport movement");
+                    Call(b, "Wheel", -120); b.StopSmooth(); Check(!b.IsSmoothScrolling, "navigation can immediately stop wheel animation");
+                }
+            }
+        }
+        static void ScopeGuideTests()
+        {
+            var json = new StringBuilder("{\"items\":[");
+            for (int i = 0; i < 150; i++) { if (i > 0) json.Append(','); json.Append("{\"n\":").Append(i).Append('}'); } json.Append("]}");
+            using (var v = Open(json.ToString()))
+            {
+                var b = Box(v); b.Select(0, 0); b.ScrollPos = Point.Empty;
+                CodeBox.ScopeGuide guide;
+                Check(b.TryGetScopeGuide(out guide), "multiline matched brackets produce a scope guide");
+                Check(guide.Top >= 0 && guide.Bottom == b.ClientSize.Height - 1 && guide.OpenY >= 0, "off-screen closing bracket clips the guide to the viewport");
+                using (var bitmap = new Bitmap(b.FoldingGutter.Width, b.FoldingGutter.Height))
+                {
+                    b.FoldingGutter.DrawToBitmap(bitmap, b.FoldingGutter.ClientRectangle);
+                    Check(bitmap.GetPixel(bitmap.Width - 3, Math.Min(bitmap.Height - 2, guide.Top + 20)).ToArgb() == Theme.Current.Accent.ToArgb(), "left gutter paints the selected scope line");
+                }
+                Native.SendMessage(b.Handle, 0x00B6, IntPtr.Zero, (IntPtr)80);
+                Check(b.TryGetScopeGuide(out guide) && guide.Top == 0 && guide.Bottom == b.ClientSize.Height - 1,
+                    "range line remains visible when both brackets are outside the screen");
+                b.Select(0, 0); b.ScrollPos = Point.Empty; b.FoldCurrent(true);
+                Check(!b.TryGetScopeGuide(out guide), "folded same-row brackets do not leave a stale vertical line");
+                b.FoldAll(false); b.Select(0, 0);
+                int height = b.LineHeight, width = b.CharacterWidth;
+                ViewSettings.FontSize = 18; Call(v, "Restyle");
+                Check(b.LineHeight > height && b.CharacterWidth > width && b.TryGetScopeGuide(out guide), "zoom refreshes cached geometry and guide length");
+                ViewSettings.FontSize = 10.5f; Call(v, "Restyle");
+                b.Select(b.Text.IndexOf("items", StringComparison.Ordinal), 0);
+                Check(!b.TryGetScopeGuide(out guide), "leaving a bracket clears its guide");
+            }
+        }
+
+        static void DrainScroll(CodeBox box)
+        {
+            var timeout = Stopwatch.StartNew();
+            while (box.IsSmoothScrolling && timeout.ElapsedMilliseconds < 1500)
+            { System.Threading.Thread.Sleep(4); Application.DoEvents(); }
+            Check(!box.IsSmoothScrolling, "pixel animation must settle instead of leaving a perpetual timer");
+        }
+        static void FluidScrollingTests()
+        {
+            var source = new StringBuilder("{\"items\":[");
+            for (int i = 0; i < 3200; i++) { if (i > 0) source.Append(','); source.Append("{\"id\":").Append(i).Append(",\"value\":[1,2,3]}"); } source.Append("]}");
+            using (var viewer = Open(source.ToString()))
+            {
+                var box = Box(viewer); string original = box.Text;
+                Check(Native.ClassName(box.Handle).Contains("RichEdit"), "pixel scrolling retains the compatible Windows editing control");
+                box.Select(0, 0); box.ScrollPos = new Point(0, 70003);
+                Check(box.ScrollPos.Y == 70003, "large document scroll coordinates must not be scaled into 16 bits");
+                var previous = box.CharPosition(0);
+                for (int i = 1; i <= 8; i++)
+                {
+                    box.ScrollPos = new Point(0, 70003 + i);
+                    Point next = box.CharPosition(0);
+                    Check(box.ScrollPos.Y == 70003 + i && previous.Y - next.Y == 1, "one pixel request must really move one pixel, not jump a row");
+                    previous = next;
+                }
+                if (SystemInformation.MouseWheelScrollLines > 0)
+                {
+                    var positions = new List<int>(); box.ViewportChanged += delegate { positions.Add(box.ScrollPos.Y); };
+                    int start = box.ScrollPos.Y, selections = 0; box.SelectionChanged += delegate { selections++; };
+                    int version = (int)Field(viewer, "textVersion");
+                    var response = Stopwatch.StartNew(); Call(box, "Wheel", -120);
+                    int immediate = box.ScrollPos.Y;
+                    Check(immediate > start && immediate < start + SystemInformation.MouseWheelScrollLines * box.LineHeight,
+                        "first visible motion occurs during wheel input and is smaller than a full tick");
+                    Check(box.AnimationInterval >= 7 && box.AnimationInterval <= 16, "frame clock adapts to supported refresh intervals");
+                    DrainScroll(box);
+                    int distance = SystemInformation.MouseWheelScrollLines * box.LineHeight;
+                    Check(Math.Abs(box.ScrollPos.Y - start - distance) <= 1, "pixel smoothing preserves configured wheel distance");
+                    Check(positions.Count >= 3, "a single tick must have multiple real intermediate positions");
+                    bool partial = false; int last = start;
+                    foreach (int position in positions) { Check(position >= last, "single-direction motion is monotonic"); if ((position - start) % box.LineHeight != 0) partial = true; last = position; }
+                    Check(partial, "long files have sub-line intermediate frames, not only whole-row steps");
+                    Check(selections == 0 && (int)Field(viewer, "textVersion") == version && box.Text == original,
+                        "animation never changes caret, text or structure version");
+                    Console.WriteLine("  wheel intermediate positions: " + positions.Count + ", frame interval: " + box.AnimationInterval + " ms");
+                    start = box.ScrollPos.Y; Call(box, "Wheel", -120); int forward = box.ScrollPos.Y;
+                    Call(box, "Wheel", 120); int reversed = box.ScrollPos.Y;
+                    Check(reversed < forward, "opposite wheel input immediately moves backwards, without old-direction drift");
+                    DrainScroll(box);
+                    Check(Math.Abs(box.ScrollPos.Y - start) <= 1, "equal quick down/up ticks return to the original position");
+                    Call(box, "Wheel", -120); var driver = Field(box, "anim");
+                    System.Threading.Thread.Sleep(65); var run = Field(driver, "run");
+                    Check(run != null && (int)run.GetType().GetField("Pending").GetValue(run) <= 1, "busy UI queues at most one frame, never a backlog of timer callbacks");
+                    box.StopSmooth(); Application.DoEvents(); int stopped = box.ScrollPos.Y;
+                    System.Threading.Thread.Sleep(30); Application.DoEvents();
+                    Check(box.ScrollPos.Y == stopped && !box.IsSmoothScrolling, "cancelled and stale frame messages cannot keep moving the document");
+                }
+            }
+        }
+        static void HiddenTextCompatibilityTests()
+        {
+            string input = "{\"unicode\":\"中文 😀 é\",\"items\":[{\"text\":\"甲\\n乙\"},{\"text\":\"尾部\"}]}";
+            using (var viewer = Open(input))
+            {
+                var box = Box(viewer); string full = box.Text;
+                box.Select(0, 0); box.FoldAll(true);
+                Check(box.Text == full && box.TextLength == full.Length, "full Unicode source includes hidden text during pixel scrolling");
+                box.SelectAll(); Check(box.SelectedText == full, "selection copy includes hidden Unicode paragraphs");
+                box.FoldAll(false);
+                int start = full.IndexOf("中文", StringComparison.Ordinal); box.Select(start, "中文 😀".Length);
+                Check(box.SelectedText == "中文 😀", "UTF-16 selection boundaries do not split or lose supplementary characters");
+                box.Select(full.Length, 0); box.SelectedText = "\n";
+                Check(box.Text == full + "\n", "final newline survives native text retrieval");
+                box.Undo(); Check(box.Text == full, "pixel scrolling preserves native text undo after folding and copy");
+                box.Select(0, 0); box.FoldCurrent(true); string before = box.Text;
+                ViewSettings.Dark = true; Call(viewer, "Restyle");
+                Check(box.Text == before && box.CollapsedCount > 0, "restyle and native hidden-text streaming do not truncate the document");
+                ViewSettings.Dark = false;
             }
         }
 
