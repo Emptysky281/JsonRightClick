@@ -7,7 +7,7 @@ $framework = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
 if (-not (Test-Path -LiteralPath (Join-Path $framework 'csc.exe'))) {
     $framework = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319'
 }
-$references = @('/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Management.dll',
+$references = @('/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Management.dll', '/r:Accessibility.dll',
     ('/r:' + (Join-Path $framework 'WPF\UIAutomationClient.dll')),
     ('/r:' + (Join-Path $framework 'WPF\UIAutomationTypes.dll')),
     ('/r:' + (Join-Path $framework 'WPF\WindowsBase.dll')))

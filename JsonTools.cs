@@ -329,13 +329,13 @@ namespace JsonRightClick
 
             string bestErr = null; int bestErrPos = -1, bestErrStart = -1;
             int lead = 0;
-            while (lead < text.Length && char.IsWhiteSpace(text[lead])) lead++;
+            while (lead < text.Length && SelectionSpace(text[lead])) lead++;
 
             // 1) 整段就是一个 JSON 值
             if (lead < text.Length && (text[lead] == '{' || text[lead] == '['))
             {
                 var res = JsonFormatter.Run(text, lead, o, 0);
-                if (res.Ok && text.Substring(res.End).Trim().Length == 0)
+                if (res.Ok && OnlySelectionSpace(text, res.End))
                 {
                     r.Pieces.Add(new Piece { IsJson = true, Text = res.Text });
                     r.Count = 1; r.Expanded = res.Expanded;
@@ -343,6 +343,20 @@ namespace JsonRightClick
                     return r;
                 }
                 if (!res.Ok) { bestErr = res.Error; bestErrPos = res.ErrorPos; bestErrStart = lead; }
+            }
+
+            // 选区可能来自调试器/日志中的字符串字面量。只在逐层解码后整个内容仍是
+            // 一个完整对象/数组时才采用，不能把原文里的普通反斜杠或字符串字段全局替换。
+            JsonFormatter.Result decoded;
+            int layers;
+            if (TryDecodeSelection(text, lead, o, out decoded, out layers))
+            {
+                r.Pieces.Add(new Piece { IsJson = true, Text = decoded.Text });
+                r.Count = 1; r.Expanded = decoded.Expanded;
+                Finish(r, decoded.Fixes);
+                string note = L.F(L.T("已解码外层 JSON 字符串/转义（{0} 层）", "Decoded outer JSON string/escaping ({0} layers)"), layers);
+                r.Warning = r.Warning == null ? note : note + L.T("；", "; ") + r.Warning;
+                return r;
             }
 
             // 2) 混合文本：扫描所有 { / [ 开头的合法 JSON 片段（超大日志设时间上限，避免卡死）
@@ -405,6 +419,46 @@ namespace JsonRightClick
                 r.Pieces.Add(new Piece { Text = after });
             Finish(r, fixes);
             return r;
+        }
+
+        static bool SelectionSpace(char c) { return char.IsWhiteSpace(c) || c == '\uFEFF'; }
+        static bool OnlySelectionSpace(string text, int start)
+        {
+            for (int i = start; i < text.Length; i++) if (!SelectionSpace(text[i])) return false;
+            return true;
+        }
+        static bool TryDecodeSelection(string text, int lead, FormatOptions options, out JsonFormatter.Result result, out int layers)
+        {
+            result = null; layers = 0;
+            if (lead >= text.Length) return false;
+            int end = text.Length;
+            while (end > lead && SelectionSpace(text[end - 1])) end--;
+            string current = text.Substring(lead, end - lead);
+            var literalOptions = new FormatOptions { Minify = true, Lenient = options.Lenient };
+            for (int layer = 1; layer <= 4 && current.Length > 0; layer++)
+            {
+                char first = current[0];
+                string literal;
+                if (first == '"' || (first == '\'' && options.Lenient)) literal = current;
+                else if (first == '{' || first == '[') literal = "\"" + current + "\"";
+                else return false;
+                // 转义层必须严格有效；仅单引号字面量按用户启用的宽松规则读取。
+                var outer = JsonFormatter.Run(literal, 0, first == '\'' ? literalOptions : StrictMin, 0);
+                if (!outer.Ok || !OnlySelectionSpace(literal, outer.End) || outer.Text.Length < 2 || outer.Text[0] != '"') return false;
+                current = Unescape(outer.Text, 1, outer.Text.Length - 2);
+                int start = 0, stop = current.Length;
+                while (start < stop && SelectionSpace(current[start])) start++;
+                while (stop > start && SelectionSpace(current[stop - 1])) stop--;
+                current = current.Substring(start, stop - start);
+                if (current.Length == 0) return false;
+                if (current[0] == '{' || current[0] == '[')
+                {
+                    var inner = JsonFormatter.Run(current, 0, options, 0);
+                    if (inner.Ok && OnlySelectionSpace(current, inner.End))
+                    { result = inner; layers = layer; return true; }
+                }
+            }
+            return false;
         }
 
         static void Finish(ParseResult r, HashSet<string> fixes)

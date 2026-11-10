@@ -8,7 +8,6 @@ using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Windows.Automation;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -428,18 +427,17 @@ namespace JsonRightClick
         readonly ContextMenuStrip menu = new ContextMenuStrip();
         readonly FloatButton floatBtn = new FloatButton();
         readonly InputHooks hooks = new InputHooks();
-        readonly SelectionTracker tracker = new SelectionTracker();
         HotkeyWindow hotkeyWnd = new HotkeyWindow();
         IpcWindow ipc;
         readonly System.Windows.Forms.Timer watchTimer = new System.Windows.Forms.Timer { Interval = 150 };
         readonly uint myPid = (uint)Process.GetCurrentProcess().Id;
 
         IntPtr targetRoot;
-        uint targetPid;
         DateTime shownAt;
         bool busy, floatEnabled, restoreClip, hotkeyOk;
         int gen;           // 每次右键/点击递增，用于作废过期的异步检测
-        uint seqAtDown;    // 最近一次左键按下时的剪贴板序号（判断终端是否复制过）
+        SelectionTarget rightClickTarget;
+        uint rightClickClipboardSequence, targetClipboardSequence;
 
         public TrayContext()
         {
@@ -458,7 +456,8 @@ namespace JsonRightClick
             // 钩子运行在独立线程：本程序界面忙（加载大文本、等剪贴板）时也不会拖慢全局鼠标键盘
             hooks.Ui = floatBtn;
             hooks.OnMouse = OnMouse;
-            hooks.OnKey = delegate(int vk, IntPtr root, bool ctrl, bool shift) { tracker.Key(vk, root, ctrl, shift); };
+            // 按键只使旧检测/按钮失效，不再把 Ctrl+A、Shift 或游戏按键当作文本选区证据。
+            hooks.OnKey = delegate { gen++; rightClickTarget = null; HideFloat(); };
             hooks.OnButtonClick = Trigger;
             hooks.Start();
 
@@ -484,7 +483,7 @@ namespace JsonRightClick
 
         void UpdateTip()
         {
-            string t = L.T("JSON 解析助手", "JSON Viewer") + (Hotkey.Current == "" ? "" : " (" + Hotkey.Display(Hotkey.Current) + ")");
+            string t = L.T("JSON 解析助手", "JSON Viewer") + " " + Application.ProductVersion + (Hotkey.Current == "" ? "" : " (" + Hotkey.Display(Hotkey.Current) + ")");
             tray.Text = t.Length > 63 ? t.Substring(0, 63) : t;
         }
 
@@ -698,67 +697,70 @@ namespace JsonRightClick
         }
 
         // ---------- 鼠标事件（由钩子线程转发到 UI 线程） ----------
-        void OnMouse(int msg, Point pt, IntPtr root, bool shift)
+        void OnMouse(int msg, Point pt, IntPtr root, IntPtr control, uint clipboardSequence)
         {
             switch (msg)
             {
                 case Native.WM_RBUTTONDOWN:
                     gen++;
                     HideFloat();
-                    break;
-                case Native.WM_RBUTTONUP:
-                    if (floatEnabled && !busy)
+                    rightClickTarget = null;
+                    uint pid;
+                    Native.GetWindowThreadProcessId(root, out pid);
+                    if (floatEnabled && !busy && IsEligible(root, pid))
                     {
-                        uint pid;
-                        Native.GetWindowThreadProcessId(root, out pid);
-                        if (IsEligible(root, pid)) ProbeAndShow(root, pid, pt);
+                        rightClickTarget = SelectionTarget.Capture(root, control, pt);
+                        hooks.WatchingSelection = rightClickTarget != null;
+                        rightClickClipboardSequence = clipboardSequence;
+                        // 菜单出现前读取真实选区，避免菜单遮挡和虚拟文本焦点切换造成漏识别。
+                        if (rightClickTarget != null) rightClickTarget.BeforeMenu = SelectionProbe.Begin(rightClickTarget);
                     }
                     break;
+                case Native.WM_RBUTTONUP:
+                    var target = rightClickTarget;
+                    rightClickTarget = null;
+                    if (target != null && target.IsCurrent && floatEnabled && !busy)
+                        ProbeAndShow(target, rightClickClipboardSequence, pt);
+                    else hooks.WatchingSelection = false;
+                    break;
                 case Native.WM_LBUTTONDOWN:
-                    gen++;
-                    HideFloat();
-                    seqAtDown = Native.GetClipboardSequenceNumber();
-                    tracker.MouseDown(pt, root, shift);
-                    break;
-                case Native.WM_LBUTTONUP:
-                    tracker.MouseUp(pt);
-                    break;
                 case Native.WM_MOUSEWHEEL:
+                    gen++;
+                    rightClickTarget = null;
                     HideFloat();
                     break;
             }
         }
 
-        // ---------- 右键后：确认有选中文字才显示按钮 ----------
-        async void ProbeAndShow(IntPtr root, uint pid, Point pt)
+        // ---------- 右键后：只有提供程序确认非空文本选区才显示按钮 ----------
+        async void ProbeAndShow(SelectionTarget target, uint clipboardSequence, Point pt)
         {
             int g = ++gen;
-            bool term = Terminal.Is(root);
-            bool likely = tracker.Likely(root);
-            var probe = term ? null : Task.Run(() => SelectionProbe.Check(root));
-            await Task.Delay(term ? 180 : 120); // 让原生右键菜单先弹出 / 让终端完成右键复制
-            if (g != gen) return;
-            bool show;
-            if (term)
+            try
             {
-                // 终端：只有终端自己把选中内容复制到了剪贴板（右键复制、选中即复制）才显示按钮
-                show = Native.GetClipboardSequenceNumber() != seqAtDown;
-            }
-            else
-            {
-                await Task.WhenAny(probe, Task.Delay(400));
-                if (g != gen) return;
-                Sel s = probe.Status == TaskStatus.RanToCompletion ? probe.Result : Sel.Unknown;
-                // 能精确判断的控件以检测结果为准；其他程序（VS Code、浏览器等）参考鼠标/键盘选择动作
-                show = s == Sel.Yes || (s == Sel.Unknown && likely);
-            }
-            if (!show || busy || !floatEnabled) return;
+                await Task.Delay(80);
+                if (g != gen || busy || !floatEnabled || !target.IsCurrent) return;
+                var probe = target.BeforeMenu ?? SelectionProbe.Begin(target);
+                await Task.WhenAny(probe, Task.Delay(550));
+                if (g != gen || busy || !floatEnabled || !target.IsCurrent) return;
+                if (probe.Status == TaskStatus.RanToCompletion && (SelectionProbe.RecheckAfterMenu(target) || !target.Fresh || probe.Result != Sel.Yes))
+                {
+                    // 原生输入框须复核右键是否取消选区；冷启动提供程序也可从原控件再确认。
+                    probe = SelectionProbe.Begin(target);
+                    await Task.WhenAny(probe, Task.Delay(300));
+                }
+                if (g != gen || busy || !floatEnabled || !target.IsCurrent) return;
+                Sel selection = probe.Status == TaskStatus.RanToCompletion ? probe.Result : Sel.Unknown;
+                if (!SelectionProbe.ShouldShow(selection)) return; // 未知、超时、不支持均不弹出。
 
-            targetRoot = root; targetPid = pid;
-            floatBtn.ShowAt(pt);
-            hooks.ButtonRect = floatBtn.ScreenBounds;
-            shownAt = DateTime.Now;
-            watchTimer.Start();
+                targetRoot = target.Root;
+                targetClipboardSequence = clipboardSequence;
+                floatBtn.ShowAt(pt);
+                hooks.ButtonRect = floatBtn.ScreenBounds;
+                shownAt = DateTime.Now;
+                watchTimer.Start();
+            }
+            finally { if (g == gen) hooks.WatchingSelection = false; }
         }
 
         bool IsEligible(IntPtr root, uint pid)
@@ -778,14 +780,13 @@ namespace JsonRightClick
         {
             if (!floatBtn.IsShown) { watchTimer.Stop(); return; }
             if ((DateTime.Now - shownAt).TotalSeconds > 8) { HideFloat(); return; }
-            Native.TopMost(floatBtn.Handle); // 保持在右键菜单之上
-            uint pid;
-            Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
-            if (pid != targetPid && pid != myPid) HideFloat();
+            if (!SelectionTarget.ForegroundBelongsTo(targetRoot)) { HideFloat(); return; }
+            Native.TopMost(floatBtn.Handle); // 只在原目标窗口仍在前台时置顶。
         }
 
         void HideFloat()
         {
+            hooks.WatchingSelection = false;
             hooks.ButtonRect = Rectangle.Empty;
             watchTimer.Stop();
             floatBtn.HideButton();
@@ -813,7 +814,7 @@ namespace JsonRightClick
                 if (Terminal.Is(fg))
                 {
                     if (fromButton) Native.Key(Keys.Escape, fg); // 只关闭终端可能弹出的菜单（发给菜单，不进 shell）
-                    if (Native.GetClipboardSequenceNumber() != seqAtDown)
+                    if (!fromButton || Native.GetClipboardSequenceNumber() != targetClipboardSequence)
                     {
                         string t = SafeGetText();
                         if (t.Length > 0) { ShowViewer(t); return; }
@@ -846,19 +847,21 @@ namespace JsonRightClick
                     }
                 }
 
-                // 等待用户松开快捷键，否则 Ctrl+C 会变成 Ctrl+Alt+C
+                // 等待用户松开快捷键，否则 Ctrl+C 会变成 Ctrl+Alt+C。
                 for (int i = 0; i < 100 && Native.ModifiersDown(); i++) await Task.Delay(20);
+                if (Native.ModifiersDown() || Native.Root(Native.GetForegroundWindow()) != fg)
+                {
+                    tray.ShowBalloonTip(2500, L.T("没有取到选中的文本", "No selected text"),
+                        L.T("目标窗口已失去焦点或快捷键尚未松开，请回到原窗口重试；也可手动复制后解析剪贴板。",
+                            "The target lost focus or shortcut keys are still held. Return to it and retry, or copy manually and parse the clipboard."), ToolTipIcon.Warning);
+                    return;
+                }
 
                 var backup = restoreClip ? ClipSnapshot.Capture(ipc.Handle) : null;
                 uint seq = Native.GetClipboardSequenceNumber();
                 Native.KeyCombo(Keys.ControlKey, Keys.C);
-
-                string text = null;
-                for (int i = 0; i < 40; i++)
-                {
-                    await Task.Delay(25);
-                    if (Native.GetClipboardSequenceNumber() != seq) { await Task.Delay(40); text = SafeGetText(); break; }
-                }
+                var copied = await SelectionCapture.ReadCopiedTextAsync(seq);
+                string text = copied.Text;
 
                 if (string.IsNullOrEmpty(text))
                 {
@@ -867,8 +870,9 @@ namespace JsonRightClick
                     return;
                 }
 
+                // 在创建窗口之前恢复原剪贴板；若用户/别的程序又复制了内容，不覆盖新内容。
+                if (backup != null && !backup.IsEmpty) backup.RestoreIfUnchanged(ipc.Handle, copied.Sequence);
                 ShowViewer(text);
-                if (backup != null && !backup.IsEmpty) backup.Restore(ipc.Handle); // 恢复全部格式（图片、文件、HTML 等）
             }
             finally { busy = false; }
         }
@@ -897,6 +901,8 @@ namespace JsonRightClick
                 L.T("用法四：在资源管理器里右键 .log / .json / .txt 等文件 →「用 JSON 解析助手打开」；也可以用托盘菜单 →「打开文件…」。",
                     "4) In File Explorer, right-click a .log / .json / .txt file → \"Open with JSON Viewer\", or use tray menu → \"Open file…\".") + "\n\n" +
                 L.T("说明：", "Notes:") + "\n" +
+                L.T("• 悬浮按钮仅在确认非空文本选区时显示；无法确认的游戏、画布或文本提供程序不会弹出。请手动复制后从托盘解析剪贴板。",
+                    "• The floating button requires a confirmed nonempty text selection. Games, canvases and unsupported text providers stay hidden; copy manually and parse from the tray instead.") + "\n" +
                 L.T("• 终端（cmd、PowerShell、Windows Terminal、PuTTY 等）里不会自动复制，避免 Ctrl+C 中断程序；请先复制再解析。",
                     "• In terminals (cmd, PowerShell, Windows Terminal, PuTTY…) nothing is auto-copied, so Ctrl+C never interrupts a program; copy first, then parse.") + "\n" +
                 L.T("• 取词后会恢复原来的剪贴板内容（包括图片、文件等），且不会出现在 Win+V 历史里。",
@@ -922,128 +928,6 @@ namespace JsonRightClick
     }
 
     // ===================== 选中文字检测 =====================
-    enum Sel { Unknown, Yes, No }
-
-    /// <summary>直接询问目标控件是否有选区（在后台线程运行）</summary>
-    static class SelectionProbe
-    {
-        public static string LastInfo = "";
-        static IntPtr FindEditor(IntPtr root)
-        {
-            foreach (var cls in new[] { "RichEditD2DPT", "Scintilla", "Edit" })
-            {
-                IntPtr h = FindChild(root, cls, 0);
-                if (h != IntPtr.Zero) return h;
-            }
-            return IntPtr.Zero;
-        }
-
-        static IntPtr FindChild(IntPtr parent, string cls, int depth)
-        {
-            if (depth > 6) return IntPtr.Zero;
-            IntPtr c = IntPtr.Zero;
-            while ((c = Native.FindWindowEx(parent, c, null, null)) != IntPtr.Zero)
-            {
-                if (Native.ClassName(c) == cls) return c;
-                IntPtr d = FindChild(c, cls, depth + 1);
-                if (d != IntPtr.Zero) return d;
-            }
-            return IntPtr.Zero;
-        }
-
-        public static Sel Check(IntPtr root)
-        {
-            uint pid;
-            uint tid = Native.GetWindowThreadProcessId(root, out pid);
-            var gti = new Native.GUITHREADINFO();
-            gti.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
-            IntPtr focus = Native.GetGUIThreadInfo(tid, ref gti) ? gti.hwndFocus : IntPtr.Zero;
-            if (focus == IntPtr.Zero) focus = FindEditor(root); // 拿不到焦点控件时，找窗口里的编辑框
-            if (focus == IntPtr.Zero) return Sel.Unknown;
-            string cls = Native.ClassName(focus);
-            IntPtr res;
-            LastInfo = "class=" + cls;
-
-            // Notepad++ 等 Scintilla 编辑器
-            if (cls.StartsWith("Scintilla", StringComparison.OrdinalIgnoreCase))
-            {
-                if (Native.Send(focus, 2650 /* SCI_GETSELECTIONEMPTY */, out res)) return res == IntPtr.Zero ? Sel.Yes : Sel.No;
-                return Sel.Unknown;
-            }
-
-            // 记事本、写字板等标准编辑框
-            if (cls == "Edit" || cls.StartsWith("WindowsForms10.EDIT", StringComparison.OrdinalIgnoreCase)) // RichEdit 系列（含 Win11 记事本）返回值不可靠，走 UI 自动化
-            {
-                if (Native.Send(focus, 0x00B0 /* EM_GETSEL */, out res))
-                {
-                    uint v = (uint)res.ToInt64();
-                    LastInfo += " sel=" + (v & 0xFFFF) + "-" + (v >> 16);
-                    if (v != 0xFFFFFFFF) // 超过 65535 字符时无法从返回值判断，交给 UI 自动化
-                        return (v & 0xFFFF) != (v >> 16) ? Sel.Yes : Sel.No;
-                }
-            }
-
-            // 其他程序：UI 自动化 TextPattern
-            try
-            {
-                var el = AutomationElement.FromHandle(focus);
-                object pat;
-                if (el.TryGetCurrentPattern(TextPattern.Pattern, out pat))
-                {
-                    LastInfo += " uia";
-                    foreach (var range in ((TextPattern)pat).GetSelection())
-                        if (!string.IsNullOrEmpty(range.GetText(1))) return Sel.Yes;
-                    // 浏览器/Electron 的“无选区”结果不可靠，交给动作判断
-                    return cls.StartsWith("Chrome_", StringComparison.Ordinal) || cls.StartsWith("Mozilla", StringComparison.Ordinal)
-                        ? Sel.Unknown : Sel.No;
-                }
-            }
-            catch { }
-            return Sel.Unknown;
-        }
-    }
-
-    /// <summary>根据鼠标/键盘动作推断是否刚选中了文字（用于无法直接检测的程序）</summary>
-    sealed class SelectionTracker
-    {
-        IntPtr selRoot, downRoot;
-        bool selected, shiftAtDown;
-        Point downPt, lastUpPt;
-        DateTime lastUp = DateTime.MinValue;
-
-        public bool Likely(IntPtr root) { return selected && root == selRoot; }
-
-        public void MouseDown(Point pt, IntPtr root, bool shift)
-        {
-            downPt = pt; downRoot = root;
-            shiftAtDown = shift;
-        }
-
-        public void MouseUp(Point pt)
-        {
-            var drag = SystemInformation.DragSize;
-            bool dragged = Math.Abs(pt.X - downPt.X) > drag.Width || Math.Abs(pt.Y - downPt.Y) > drag.Height;
-            bool dbl = (DateTime.Now - lastUp).TotalMilliseconds <= SystemInformation.DoubleClickTime
-                && Math.Abs(pt.X - lastUpPt.X) <= 4 && Math.Abs(pt.Y - lastUpPt.Y) <= 4;
-            lastUp = DateTime.Now; lastUpPt = pt;
-            selRoot = downRoot;
-            selected = dragged || dbl || shiftAtDown; // 拖选、双击/三击选词、Shift+点击
-        }
-
-        public void Key(int vk, IntPtr root, bool ctrl, bool shift)
-        {
-            if ((vk >= 0x10 && vk <= 0x12) || (vk >= 0xA0 && vk <= 0xA5) || vk == 0x5B || vk == 0x5C) return; // 修饰键本身
-            if (vk == 0x1B || vk == 0x5D) return; // Esc、菜单键不影响选区
-            if (ctrl && (vk == 'C' || vk == 0x2D)) return; // 复制
-            if (shift && vk == 0x79) return;               // Shift+F10 打开菜单
-            if ((ctrl && vk == 'A') || (shift && vk >= 0x21 && vk <= 0x28)) // Ctrl+A、Shift+方向/Home/End/翻页
-            {
-                selRoot = root; selected = true; return;
-            }
-            selected = false; // 其它按键（输入、删除、移动光标）通常会取消选区
-        }
-    }
-
     // ===================== 悬浮按钮（逐像素透明，不抢焦点，按显示器 DPI 缩放） =====================
     /// <summary>
     /// 窗口在“每显示器 DPI 感知 v2”模式下创建，坐标与钩子给出的物理像素一致，
@@ -1167,8 +1051,8 @@ namespace JsonRightClick
     sealed class InputHooks
     {
         public Control Ui;
-        public Action<int, Point, IntPtr, bool> OnMouse;
-        public Action<int, IntPtr, bool, bool> OnKey;
+        public Action<int, Point, IntPtr, IntPtr, uint> OnMouse;
+        public Action OnKey;
         public Action OnButtonClick;
 
         readonly object gate = new object();
@@ -1178,6 +1062,12 @@ namespace JsonRightClick
         bool swallowUp;
         uint threadId;
 
+        bool watchingSelection;
+        public bool WatchingSelection
+        {
+            get { lock (gate) return watchingSelection; }
+            set { lock (gate) watchingSelection = value; }
+        }
         public Rectangle ButtonRect
         {
             get { lock (gate) return buttonRect; }
@@ -1222,9 +1112,9 @@ namespace JsonRightClick
             if (code >= 0)
             {
                 int msg = (int)wParam;
-                // 滚轮只在悬浮按钮显示时才需要（用来隐藏按钮），平时直接放行，不打扰任何窗口的滚动
+                // 仅按钮可见/选区检测在途时才转发滚轮，以取消旧检测；其余时间不打扰滚动。
                 if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_LBUTTONUP || msg == Native.WM_RBUTTONDOWN
-                    || msg == Native.WM_RBUTTONUP || (msg == Native.WM_MOUSEWHEEL && !ButtonRect.IsEmpty))
+                    || msg == Native.WM_RBUTTONUP || (msg == Native.WM_MOUSEWHEEL && (!ButtonRect.IsEmpty || WatchingSelection)))
                 {
                     var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
                     if ((info.flags & 1) == 0) // 忽略程序模拟的鼠标事件
@@ -1238,8 +1128,11 @@ namespace JsonRightClick
                             return (IntPtr)1; // 吞掉这次点击，避免右键菜单把它当成“点在菜单外”
                         }
                         if (msg == Native.WM_LBUTTONUP && swallowUp) { swallowUp = false; return (IntPtr)1; }
-                        IntPtr root = msg == Native.WM_MOUSEWHEEL ? IntPtr.Zero : Native.Root(Native.WindowFromPoint(info.pt));
-                        Post(OnMouse, msg, pt, root, Native.IsKeyDown(0x10));
+                        IntPtr control = msg == Native.WM_MOUSEWHEEL ? IntPtr.Zero : Native.WindowFromPoint(info.pt);
+                        IntPtr root = control == IntPtr.Zero ? IntPtr.Zero : Native.Root(control);
+                        // 仅保存 HWND 与版本号等廉价元数据；选中文字及所有可访问性查询仍在后台。
+                        uint sequence = msg == Native.WM_RBUTTONDOWN ? Native.GetClipboardSequenceNumber() : 0;
+                        Post(OnMouse, msg, pt, root, control, sequence);
                     }
                 }
             }
@@ -1249,12 +1142,11 @@ namespace JsonRightClick
         IntPtr KeyCallback(int code, IntPtr wParam, IntPtr lParam)
         {
             int msg = (int)wParam;
-            if (code >= 0 && (msg == 0x0100 || msg == 0x0104)) // WM_KEYDOWN / WM_SYSKEYDOWN
+            // 不再追踪全局选区手势；只有检测在途/按钮可见时，按键才需要通知 UI 作废结果。
+            if (code >= 0 && (msg == 0x0100 || msg == 0x0104) && (WatchingSelection || !ButtonRect.IsEmpty))
             {
-                int vk = Marshal.ReadInt32(lParam);
                 int flags = Marshal.ReadInt32(lParam, 8);
-                if ((flags & 0x10) == 0) // 忽略模拟按键
-                    Post(OnKey, vk, Native.Root(Native.GetForegroundWindow()), Native.IsKeyDown(0x11), Native.IsKeyDown(0x10));
+                if ((flags & 0x10) == 0) Post(OnKey); // 忽略模拟按键；不查询/记录用户输入的具体键值。
             }
             return Native.CallNextHookEx(keyHook, code, wParam, lParam);
         }
@@ -1273,6 +1165,13 @@ namespace JsonRightClick
                 catch (ThreadStateException) { return false; }
             }
             return false;
+        }
+
+        // 轮询复制结果时不能在 UI 线程 Sleep；被占用/格式尚未发布由异步读取流程重试。
+        public static string TryGetText()
+        {
+            try { return Clipboard.ContainsText() ? Clipboard.GetText() : ""; }
+            catch (ExternalException) { return null; }
         }
 
         /// <summary>返回剪贴板文本；没有文本返回 ""；一直被占用返回 null</summary>

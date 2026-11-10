@@ -12,15 +12,24 @@
 
 ## 功能
 
-- **选中文本即用**：选中文字后右键时出现悬浮的「解析 JSON」按钮；也可用全局快捷键（默认 `Ctrl+Alt+J`，可自定义）或托盘菜单解析剪贴板。
+- **选中文本即用**：选中文字后右键时出现悬浮的「解析 JSON」按钮；也可用全局快捷键（默认 `Ctrl+Alt+J`，可自定义）或托盘菜单解析剪贴板。复制时异步等待剪贴板格式稳定并重试暂时占用/尚未就绪的文本，不会拿旧剪贴板充当选区。
+- **转义选区兼容**：支持选中完整的 JSON 字符串字面量、无外层引号的转义 JSON 及最多 4 层外层编码；仅在解码后整个内容是合法对象/数组时采用，并明确提示。不会全局删除反斜杠，也不会擅自展开普通 JSON 内的字符串字段。
 - **资源管理器右键菜单**：右键 .log / .json / .txt 等文件「用 JSON 解析助手打开」。Win11 下可放在第一层菜单（需开发人员模式），也可用经典菜单。
 - **混合文本**：从日志里提取多段 JSON，非 JSON 内容原样保留；「只看 JSON」模式下的修改会合并回全文。
 - **查看工具**：树形视图、JSON 路径、全部匹配高亮搜索（支持正则 / 大小写）、敏感字段打码、JWT 解码、时间戳提示、展开嵌套 JSON 字符串、宽松解析（单引号、尾逗号、注释、Python 字面量）、压缩 / 格式化。
-- **括号配对**：点击 `{` / `}` / `[` / `]`，或用方向键把光标移到括号旁，会同时高亮对应的一对括号，并在左侧折叠栏及文本缩进处显示该层级的竖向范围线；括号在屏幕外时范围线会裁剪到可见区域。另一端超出可视区域时，编辑区顶部或底部显示对应行预览，点击预览即可跳转。展开嵌套、压缩、撤销、只看 JSON、打码及大文件模式下均可使用；字符串内的括号不会误匹配。
+- **括号配对**：将输入光标放在 `{` / `}` / `[` / `]` 的任意一侧（括号前或后），即可同时高亮对应的一对括号；鼠标点击与方向键移动均可触发，无需选中文字，并在左侧折叠栏及文本缩进处显示该层级的竖向范围线；括号在屏幕外时范围线会裁剪到可见区域。另一端超出可视区域时，编辑区顶部或底部显示对应行预览，点击预览即可跳转。展开嵌套、压缩、撤销、只看 JSON、打码及大文件模式下均可使用；字符串内的括号不会误匹配。
 - **代码折叠**：编辑区左侧点击 `− / +` 手动折叠或展开对象 / 数组；收起后点击 `{…}` / `[…]` 可展开。工具栏「折叠」及右键「代码折叠」支持当前层级、全部折叠 / 展开；子层级的独立折叠状态会保留。折叠只改变显示，复制、格式化和撤销使用的仍是完整原文，搜索或树形定位会自动展开目标。
 - **悬停提示**：嵌套 JSON 字符串、JWT、时间戳的提示跟随鼠标，在同一段长文本内移动也会更新位置；靠近屏幕边缘自动调整，滚动、编辑或离开编辑区后隐藏。
 - **界面**：深色 / 浅色主题、导入字体（保存在程序目录 `Fonts\`）、字号记忆、中英文切换、开机自启。
 - 单个 exe，只依赖 Windows 自带的 .NET Framework 4.x，**不联网**。
+
+### 悬浮按钮的多通道选区识别
+
+- 只有原文字区域提供真实非空选区证据，才显示「解析 JSON」按钮：标准 Edit / RichEdit / Scintilla 使用原生接口；其他控件依次使用 MSAA + IAccessible2、UI Automation TextPattern。兼容没有 TextPattern 的 Chromium / Electron / Firefox 文本提供程序，不依赖软件进程名白名单。
+- 右键按下时就开始读取选区，短时间保留同一次手势的真实证据，避免菜单弹出后遮住文字或改变焦点。冷启动提供程序可从保存的原控件再确认；无选区叶节点不会提前截断父 Document/编辑器的选区查询。
+- UIA 在原命中点所在的可见分支中有界寻找虚拟文档；父文档里其他位置的选区不能让画布/图片点击也触发。密码框、普通光标和仅图片占位符仍不算文本选区。
+- 拖动、双击、Shift、Ctrl+A 或剪贴板变化本身都不是证据，不恢复游戏操作误弹的手势推测，也不查询其他窗口的旧选区。键盘、左键、滚轮或切换窗口会作废待显示结果。
+- 所有查询在后台进行，同一时间最多一项；只读取选区位置和少量选中文字样本，不模拟 Ctrl+C、不改剪贴板。不提供任何可靠选区接口的软件仍不自动弹出，可手动复制后从托盘解析；终端快捷键只读取已有剪贴板，不发送 Ctrl+C。
 
 ### 滚动与大文本性能
 
@@ -28,7 +37,9 @@
 - 词法结果、字体尺寸与文档长度复用缓存，纯着色不会使搜索、DOM 或括号缓存失效。
 - 长搜索匹配只计算屏幕内的显示行；编辑区与侧栏合成呈现以减少闪烁。
 - 超长文件也按真实像素平滑滚动，不再退回整行跳动；首个小位移在滚轮输入时立即发生，反向输入会立刻反向。
-- 根据屏幕刷新率选择约 7–16 ms 的帧间隔，UI 忙时只保留一个待处理帧，避免累积拖尾。滚动条、键盘、失焦或窗口关闭会取消动画。
+- 使用 Windows 原生高精度等待计时器，避免 .NET Timer 将 16 ms 请求量化为约 31 ms。根据屏幕刷新率选择约 7–16 ms 的帧间隔，UI 忙时只保留一个待处理帧，空闲时不轮询；不可用时自动回退。滚动条、键盘、失焦或窗口关闭会取消动画。
+- 路径/DOM、搜索、树形重建及长字符串悬停解码在滚动动画结束后处理，避免后台辅助功能抢占滚动帧。
+- 失焦后悬停滚动，再激活或点击编辑区时保持当前浏览位置；恢复焦点及输入法光标位置查询不再把视口拉回旧光标。真实输入、输入法组合及显式搜索/树形跳转仍可正常定位。
 - 折叠、复制、撤销及敏感字段打码的语义不变。
 
 ### 折叠快捷键
@@ -101,10 +112,10 @@ JsonRightClick.exe --uitest samples\sample.log out.txt
 滚动性能基准（可选，用同一份 5000 条嵌套记录及 12.5 万字符搜索匹配对比本地旧提交）：
 
 ```powershell
-.\tests\run-scroll-benchmark.ps1 -BaselineRef 71369dc
+.\tests\run-scroll-benchmark.ps1 -BaselineRef 88b0707
 ```
 
-基准会确认文档确实滚动，报告补色总耗时 / 最长时间片、选区事件数、滚动帧 P50 / P95 和长匹配重绘耗时。结果写入 `.test-output/`；不同机器、字体和文档的结果会有差异。
+基准会确认文档确实滚动，报告帧时钟真实投递间隔 P50 / P95、补色总耗时 / 最长时间片、选区事件数、滚动绘制 P50 / P95 和长匹配重绘耗时。结果写入 `.test-output/`；不同机器、字体和文档的结果会有差异。
 
 ## License
 
@@ -116,7 +127,7 @@ JsonRightClick.exe --uitest samples\sample.log out.txt
 
 **JsonRightClick** formats JSON embedded in any selected text (logs, API responses, chat messages) and shows it in a separate editable window. Nothing is written back to the source.
 
-- Select text → right-click → floating **Parse JSON** button, or a global hotkey (default `Ctrl+Alt+J`), or parse the clipboard from the tray.
+- Select text → right-click → floating **Parse JSON** button, or a global hotkey (default `Ctrl+Alt+J`), or parse the clipboard from the tray. The button requires a confirmed nonempty text selection, using native Edit/RichEdit/Scintilla, MSAA/IAccessible2 and UIA TextPattern providers. It starts probing before context menus obscure the text; unknown, unsupported or timed-out providers stay hidden. Mouse gestures and clipboard changes are never treated as proof. Copy manually and use the tray if an application does not expose its text selection.
 - File Explorer context menu for .log / .json / .txt files (Windows 11 top-level menu via a sparse package with Developer Mode, or the classic menu).
 - Keeps non-JSON text intact; edits made in *JSON only* mode are merged back.
 - Tree view, JSON path, highlight-all search with regex, sensitive-field masking, JWT decoding, timestamp hints, nested-JSON expansion, lenient parsing.

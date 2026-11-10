@@ -7,7 +7,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $framework 'csc.exe'))) {
 $output = Join-Path $root '.test-output'
 New-Item -ItemType Directory -Path $output -Force | Out-Null
 $references = @(
-    '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Management.dll',
+    '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Management.dll', '/r:Accessibility.dll',
     ('/r:' + (Join-Path $framework 'WPF\UIAutomationClient.dll')),
     ('/r:' + (Join-Path $framework 'WPF\UIAutomationTypes.dll')),
     ('/r:' + (Join-Path $framework 'WPF\WindowsBase.dll'))

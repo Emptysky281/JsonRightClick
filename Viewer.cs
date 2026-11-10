@@ -897,6 +897,8 @@ namespace JsonRightClick
         /// <summary>重新计算所有匹配并高亮；select=true 时选中光标后最近的一个</summary>
         void UpdateMatches(bool select)
         {
+            if (box.IsSmoothScrolling && search.Text.Length > 0)
+            { matchSelectPending |= select; matchTimer.Start(); return; }
             matchSelectPending = false;
             matches = new List<int[]>();
             matchError = null;
@@ -984,19 +986,24 @@ namespace JsonRightClick
             if (IsDisposed || Disposing || box.IsDisposed) return;
             if (box.SelectionLength != 0) { box.ClearBracketMatch(); return; }
             string text = BoxText;
-            int at = clickedIndex >= 0 ? clickedIndex : box.SelectionStart;
-            bool adjacent = clickedIndex < 0;
-            if (!BracketIndex.IsBracket(text, at) && (!adjacent || !BracketIndex.IsBracket(text, at - 1)))
+            int caret = box.SelectionStart;
+            // 输入光标是字符之间的位置：无论键盘移动还是鼠标落点，都检查右侧和左侧字符。
+            // MouseUp 命中换行/逗号时，不能覆盖 SelectionChanged 已找到的相邻括号。
+            if (!BracketIndex.IsBracket(text, caret) && !BracketIndex.IsBracket(text, caret - 1))
             { box.ClearBracketMatch(); return; }
             if (bracketIndex == null || bracketVersion != textVersion)
             {
                 bracketIndex = box.FoldingIndexFor(text) ?? new BracketIndex(text);
                 bracketVersion = textVersion;
             }
-            int other;
-            if (!bracketIndex.TryGetPair(at, out other))
+            int at = caret, other;
+            // 两侧恰好都是括号时保留直接点击的层级；非相邻的鼠标命中不参与判断。
+            if (clickedIndex >= 0 && (clickedIndex == caret || clickedIndex == caret - 1) && bracketIndex.TryGetPair(clickedIndex, out other))
+                at = clickedIndex;
+            else if (!bracketIndex.TryGetPair(at, out other))
             {
-                if (!adjacent || !bracketIndex.TryGetPair(--at, out other)) { box.ClearBracketMatch(); return; }
+                at = caret - 1;
+                if (!bracketIndex.TryGetPair(at, out other)) { box.ClearBracketMatch(); return; }
             }
             int open = Math.Min(at, other), close = Math.Max(at, other);
             box.SetBracketMatch(open, close, at, bracketIndex.ContextAt(open), bracketIndex.ContextAt(close));
@@ -1034,6 +1041,7 @@ namespace JsonRightClick
 
         void UpdatePath()
         {
+            if (box.IsSmoothScrolling) { pathTimer.Start(); return; }
             if (BoxText.Length > 3000000) { pathLabel.Text = ""; return; }
             pathLabel.Text = PathAt(box.SelectionStart) ?? "";
         }
@@ -1052,6 +1060,7 @@ namespace JsonRightClick
         void RebuildTree()
         {
             if (!btnTree.Checked || split.Panel2Collapsed) return;
+            if (box.IsSmoothScrolling) { treeTimer.Start(); return; }
             tree.SetRoots(GetDom());
         }
 
@@ -1116,6 +1125,7 @@ namespace JsonRightClick
 
         void HoverAt(Point pt)
         {
+            if (box.IsSmoothScrolling) { HideTip(); return; }
             if (BoxText.Length == 0 || box.IsFoldPlaceholder(pt)) { HideTip(); return; }
             int idx = box.CharIndexAt(pt);
             var cp = box.CharPosition(idx);

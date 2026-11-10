@@ -36,6 +36,11 @@ namespace JsonRightClick
                 Application.EnableVisualStyles();
                 ViewSettings.NoPersist = true;
                 ViewSettings.ShowTree = false; ViewSettings.FontName = "Consolas"; ViewSettings.FontSize = 10.5f;
+                Run("selection detection: strict evidence, games/canvas, password and 32-bit ranges", StrictSelectionTests);
+                Run("selection detection: bounded workers, errors and MTA isolation", SelectionProbeConcurrencyTests);
+                Run("selection compatibility: IA2 ranges, object samples, hit geometry and fresh evidence", SelectionCompatibilityTests);
+                Run("selection input: full quoted/escaped JSON and nested-field preservation", SelectionInputTests);
+                Run("selection capture: delayed formats, busy clipboard and version races", SelectionCaptureTests);
                 Run("bracket index: nesting, escaping, comments, invalid input", IndexTests);
                 Run("bracket index: recursive nested-string expansion", ExpansionIndexTests);
                 Run("bracket index: large document and deep nesting", LargeIndexTests);
@@ -59,13 +64,284 @@ namespace JsonRightClick
                 Run("rendering: long matches visit visible rows only", BoundedHighlightTests);
                 Run("scrolling: real movement, notification dedup and long-file easing", SmoothScrollTests);
                 Run("scope guides: full range, viewport clipping, folding and zoom", ScopeGuideTests);
+                Run("scope guides: caret on both sides, mouse-up and nested expansion", AdjacentCaretGuideTests);
                 Run("fluid scrolling: high precision, immediate response, reversal and bounded queue", FluidScrollingTests);
                 Run("pixel scrolling: hidden Unicode text, selections and mutation safety", HiddenTextCompatibilityTests);
+                Run("native frame clock: restart, cancellation, disposal and deferred work", FrameLifecycleTests);
+                Run("inactive scrolling: focus/IME queries preserve the browsed viewport", InactiveScrollActivationTests);
                 Console.WriteLine("ALL PASSED: " + checks + " assertions");
                 return 0;
             }
             catch (Exception ex) { Console.Error.WriteLine("FAIL " + ex); return 1; }
         }
+
+        static T WaitForProbe<T>(System.Threading.Tasks.Task<T> task)
+        {
+            var timeout = Stopwatch.StartNew();
+            while (!task.IsCompleted && timeout.ElapsedMilliseconds < 4000)
+            { Application.DoEvents(); System.Threading.Thread.Sleep(1); }
+            Check(task.IsCompleted, "selection read completes without blocking the UI thread");
+            return task.GetAwaiter().GetResult();
+        }
+        static void StrictSelectionTests()
+        {
+            Check(SelectionProbe.ShouldShow(Sel.Yes), "only a confirmed text selection can show the floating button");
+            Check(!SelectionProbe.ShouldShow(Sel.No) && !SelectionProbe.ShouldShow(Sel.Unknown),
+                "game drags/double-clicks/Ctrl+A and clipboard changes cannot turn unknown/no into yes");
+            Check(!SelectionProbe.NonEmptyTextRange(0, "x") && !SelectionProbe.NonEmptyTextRange(1, "x"), "a caret or reversed range is not selected text");
+            Check(!SelectionProbe.NonEmptyTextRange(-1, null) && !SelectionProbe.NonEmptyTextRange(-1, ""), "empty ranges never count as text");
+            Check(!SelectionProbe.NonEmptyTextRange(-1, "\uFFFC"), "a selected image/object is not selected text");
+            Check(SelectionProbe.NonEmptyTextRange(-1, "中") && SelectionProbe.NonEmptyTextRange(-1, " "), "real Unicode and whitespace selections count");
+            using (var host = new Form { Size = new Size(650, 350), ShowInTaskbar = false })
+            using (var edit = new TextBox { Multiline = true, Bounds = new Rectangle(10, 10, 280, 100), MaxLength = int.MaxValue })
+            using (var rich = new RichTextBox { Bounds = new Rectangle(300, 10, 280, 100), MaxLength = int.MaxValue })
+            using (var password = new TextBox { Bounds = new Rectangle(10, 130, 250, 24), UseSystemPasswordChar = true, Text = "synthetic only" })
+            using (var canvas = new Panel { Bounds = new Rectangle(10, 180, 500, 100) })
+            {
+                host.Controls.AddRange(new Control[] { edit, rich, password, canvas }); host.Show(); Application.DoEvents();
+                edit.Text = "plain 中文 selection"; rich.Text = "rich 中文 selection";
+                IntPtr editHandle = edit.Handle, richHandle = rich.Handle, passwordHandle = password.Handle, canvasHandle = canvas.Handle;
+                edit.Select(2, 0); rich.Select(3, 0);
+                Check(WaitForProbe(System.Threading.Tasks.Task.Run(() => SelectionProbe.NativeSelection(editHandle))) == Sel.No,
+                    "ordinary insertion caret in a native edit control does not show the button");
+                edit.Select(0, 5); rich.Select(5, 2); password.SelectAll();
+                Check(WaitForProbe(System.Threading.Tasks.Task.Run(() => SelectionProbe.NativeSelection(editHandle))) == Sel.Yes, "native Edit nonempty text selection is confirmed");
+                Check(WaitForProbe(System.Threading.Tasks.Task.Run(() => SelectionProbe.NativeSelection(richHandle))) == Sel.Yes, "RichEdit nonempty text selection is confirmed");
+                Check(WaitForProbe(System.Threading.Tasks.Task.Run(() => SelectionProbe.NativeSelection(passwordHandle))) == Sel.No,
+                    "a password field is excluded even when its characters are selected");
+                Check(WaitForProbe(System.Threading.Tasks.Task.Run(() => SelectionProbe.NativeSelection(canvasHandle))) == Sel.Unknown,
+                    "a game-like canvas never receives editor selection messages");
+                Point point = canvas.PointToScreen(new Point(10, 10));
+                var target = new SelectionTarget(host.Handle, canvasHandle, point);
+                var canvasProbe = SelectionProbe.Begin(target);
+                // 实际托盘只给提供程序有限等待时间。自绘画布的 UIA/MSAA 提供程序可能
+                // 永远不返回，回归测试也应验证超时不弹出，而不是要求外部接口一定完成。
+                var completed = WaitForProbe(System.Threading.Tasks.Task.WhenAny(canvasProbe, System.Threading.Tasks.Task.Delay(350)));
+                Sel canvasSelection = completed == canvasProbe ? canvasProbe.GetAwaiter().GetResult() : Sel.Unknown;
+                Check(!SelectionProbe.ShouldShow(canvasSelection),
+                    "selected text in a sibling editor cannot make a right-click on the canvas eligible, including provider timeouts");
+                foreach (var control in new TextBoxBase[] { edit, rich })
+                {
+                    control.Text = new string('x', 80000) + "中文"; control.Select(70000, 0); IntPtr handle = control.Handle;
+                    Check(WaitForProbe(System.Threading.Tasks.Task.Run(() => SelectionProbe.NativeSelection(handle))) == Sel.No,
+                        "a caret above 65535 chars does not look like a selection");
+                    control.Select(70000, 12);
+                    Check(WaitForProbe(System.Threading.Tasks.Task.Run(() => SelectionProbe.NativeSelection(handle))) == Sel.Yes,
+                        "full 32-bit native selection endpoints preserve long-document selection");
+                }
+                Check(!new SelectionTarget(IntPtr.Zero, editHandle, point).IsCurrent, "invalid target roots are rejected");
+                Check(!new SelectionTarget(host.Handle, IntPtr.Zero, point).IsCurrent, "destroyed/missing targets are rejected");
+            }
+        }
+        static void SelectionCompatibilityTests()
+        {
+            Check(SelectionProbe.NativeTextClass("Edit") && SelectionProbe.NativeTextClass("WindowsForms10.RichEdit20W.app") && SelectionProbe.NativeTextClass("Scintilla"),
+                "known native text controls receive an after-menu recheck instead of stale early proof");
+            Check(!SelectionProbe.NativeTextClass("Chrome_RenderWidgetHostHWND") && !SelectionProbe.NativeTextClass("RichEditD2DPT") && !SelectionProbe.NativeTextClass("UnrealWindow"),
+                "browsers and modern virtual text controls use accessibility providers; games are not treated as edit controls");
+            Check(SelectionProbe.NonEmptyTextRange(-1, "\uFFFC中文"), "an embedded object before real selected text cannot hide that text");
+            Check(!SelectionProbe.NonEmptyTextRange(-1, "\uFFFC\uFFFC\0"), "only image/object placeholders still do not count as text");
+            Check(!LegacyTextSelection.ValidOffsets(-1, 12) && !LegacyTextSelection.ValidOffsets(12, -1), "IA2 special/missing offsets are rejected");
+            Check(!LegacyTextSelection.ValidOffsets(12, 12), "IA2 insertion caret is not a nonempty selection");
+            Check(LegacyTextSelection.ValidOffsets(10, 20) && LegacyTextSelection.ValidOffsets(20, 10), "forward and reversed IA2 selection endpoints are supported");
+            Check(LegacyTextSelection.OffsetWithinSelection(10, 20, 15) && LegacyTextSelection.OffsetWithinSelection(20, 10, 15), "IA2 click falls inside either selection direction");
+            Check(!LegacyTextSelection.OffsetWithinSelection(10, 20, 35) && !LegacyTextSelection.OffsetWithinSelection(10, 20, -1),
+                "a selection elsewhere in the document cannot make canvas/image clicks eligible");
+            Check(LegacyTextSelection.OffsetWithinSelection(int.MaxValue - 8, int.MaxValue, int.MaxValue - 4), "32-bit IA2 offsets never overflow while checking the hit");
+            var rectangles = new[] { new System.Windows.Rect(20, 30, 80, 18), new System.Windows.Rect(20, 48, 150, 18) };
+            Check(SelectionProbe.NearSelection(rectangles, new Point(30, 35)) && SelectionProbe.NearSelection(rectangles, new Point(160, 55)), "selected text can wrap over multiple visual rows");
+            Check(!SelectionProbe.NearSelection(rectangles, new Point(50, 250)), "a distant canvas is excluded even when its parent document has a real selection");
+            Check(SelectionProbe.NearSelection(rectangles, new Point(103, 35)), "small pointer/glyph boundary differences do not drop a real selection");
+            Check(SelectionProbe.NearSelection(new[] { new System.Windows.Rect(-1800, -120, 90, 24) }, new Point(-1750, -110)), "negative monitor coordinates are supported");
+            Check(SelectionProbe.ContainsTextHit(-1, 1) && SelectionProbe.ContainsTextHit(0, 1), "UIA point ranges locate a hit when visible rectangles are unavailable");
+            Check(!SelectionProbe.ContainsTextHit(1, 2) && !SelectionProbe.ContainsTextHit(-2, -1) && !SelectionProbe.ContainsTextHit(-1, 0),
+                "a missing rectangle does not allow a distant or just-past-end document selection to match");
+            Check(SelectionProbe.NearSelection(null, Point.Empty) && SelectionProbe.NearSelection(new System.Windows.Rect[0], Point.Empty),
+                "a provider without range geometry may still prove actual selected text");
+            Check(!SelectionProbe.NearSelection(new[] { System.Windows.Rect.Empty }, Point.Empty), "an explicitly empty visible range is not a hit");
+            Check(SelectionTarget.FreshAge(0) && SelectionTarget.FreshAge(1499) && !SelectionTarget.FreshAge(1501) && !SelectionTarget.FreshAge(-1),
+                "only recent same-gesture evidence may survive a context menu focus change");
+            var target = new SelectionTarget(IntPtr.Zero, IntPtr.Zero, Point.Empty);
+            Check(target.Fresh, "new gesture evidence uses a monotonic clock");
+            target.BeforeMenu = System.Threading.Tasks.Task.FromResult(Sel.Yes);
+            Check(target.BeforeMenu.Result == Sel.Yes && !target.IsCurrent, "cached proof never overrides the independent foreground/target validation");
+        }
+
+        static void SelectionProbeConcurrencyTests()
+        {
+            var runner = new SelectionProbeRunner();
+            using (var started = new System.Threading.ManualResetEventSlim())
+            using (var release = new System.Threading.ManualResetEventSlim())
+            {
+                int calls = 0;
+                var first = runner.Run(() =>
+                {
+                    System.Threading.Interlocked.Increment(ref calls); started.Set();
+                    release.Wait(3000); return Sel.Yes;
+                });
+                Check(started.Wait(1000), "first background selection probe started");
+                try
+                {
+                    for (int i = 0; i < 80; i++)
+                    {
+                        var skipped = runner.Run(() => { System.Threading.Interlocked.Increment(ref calls); return Sel.Yes; });
+                        Check(skipped.IsCompleted && skipped.Result == Sel.Unknown, "busy/slow providers cause fail-closed responses, never queued work");
+                    }
+                    Check(calls == 1 && !first.IsCompleted, "right-click spam cannot accumulate provider calls or worker threads");
+                }
+                finally { release.Set(); }
+                Check(WaitForProbe(first) == Sel.Yes, "the original provider can still finish");
+            }
+            Check(WaitForProbe(runner.Run(() => { throw new InvalidOperationException("synthetic provider failure"); })) == Sel.Unknown,
+                "provider errors do not escape into the tray or count as text selection");
+            Check(WaitForProbe(runner.Run(() => Sel.No)) == Sel.No, "the worker slot is reusable after failure");
+            Check(WaitForProbe(runner.Run(() => System.Threading.Thread.CurrentThread.GetApartmentState() == System.Threading.ApartmentState.MTA ? Sel.Yes : Sel.No)) == Sel.Yes,
+                "UI Automation queries run on an MTA worker, not the WinForms STA thread");
+        }
+
+
+        static string QuoteJson(string text)
+        {
+            return "\"" + text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t") + "\"";
+        }
+        static void SelectionInputTests()
+        {
+            // 与报告相同的形状，但全部为合成数据，不把用户的节点/账号内容放进仓库。
+            string nested = "{\"routes\":[{\"server\":\"example.invalid\",\"port\":[10001,10002]}],\"path\":\"C:\\\\tmp\\\\file\",\"text\":\"中文 😀\\nnext\"}";
+            var source = new StringBuilder("{\"code\":200,\"msg\":\"success\",\"data\":{\"nodes_data\":{");
+            for (int i = 0; i < 24; i++)
+            {
+                if (i > 0) source.Append(',');
+                source.Append('"').Append("node_").Append(i).Append("\":{\"uid\":\"synthetic\",\"ports\":[10001],\"active\":true}");
+            }
+            source.Append("},\"connection\":").Append(QuoteJson(nested)).Append("}}");
+            string raw = source.ToString(), expected = JsonTools.Pretty(raw);
+            Check(expected != null, "synthetic reported-shape input is valid JSON");
+            foreach (bool lenient in new[] { false, true })
+            {
+                var options = new FormatOptions { Lenient = lenient };
+                var normal = JsonTools.Process(raw, options);
+                Check(normal.Count == 1 && normal.Error == null && normal.Warning == null && normal.Pieces[0].Text == expected,
+                    "normal JSON and nested string escaping are unchanged");
+                foreach (string input in new[] { QuoteJson(raw), QuoteJson(raw).Substring(1, QuoteJson(raw).Length - 2), QuoteJson(QuoteJson(raw)), "\uFEFF \r\n" + QuoteJson(raw) + "\uFEFF" })
+                {
+                    var result = JsonTools.Process(input, options);
+                    Check(result.Count == 1 && result.Error == null && result.Warning != null && result.Pieces.Count == 1 && result.Pieces[0].Text == expected,
+                        "quoted/escaped entire selection is decoded without dropping fields or changing nested strings");
+                    var roundtrip = JsonTools.Process(JsonTools.BuildView(result.Pieces, false).Text, options);
+                    Check(roundtrip.Count == 1 && roundtrip.Warning == null && roundtrip.Pieces[0].Text == expected,
+                        "normalized selection remains stable when formatted again");
+                }
+                var expanded = JsonTools.Process(QuoteJson(raw), new FormatOptions { Lenient = lenient, Expand = true });
+                Check(expanded.Count == 1 && expanded.Expanded == 1 && JsonTools.Pretty(expanded.Pieces[0].Text) != null,
+                    "explicit nested expansion works after decoding an outer string");
+            }
+            foreach (string rawValue in new[] { "{}", "[]", "[1,2,3]", "{\"n\":4.05e+123,\"s\":\"\\u4e2d\\n\\\\literal\"}" })
+            {
+                var result = JsonTools.Process(QuoteJson(rawValue), false);
+                Check(result.Count == 1 && result.Pieces[0].Text == JsonTools.Pretty(rawValue), "empty containers, arrays, number lexemes and Unicode escapes roundtrip");
+            }
+            Check(JsonTools.Process(QuoteJson("42"), false).Count == 0, "scalar strings are not silently reinterpreted as objects");
+            Check(JsonTools.Process(QuoteJson("prefix {\"a\":1} suffix"), false).Count == 0, "not an entire object: no lossy outer-string decoding");
+            Check(JsonTools.Process(QuoteJson("{\"a\":1"), false).Count == 0, "a truncated decoded object is still a parse failure");
+            Check(JsonTools.Process("{\\\"a\\\":\\q}", new FormatOptions { Lenient = true }).Count == 0,
+                "invalid outer escape sequences are not guessed or stripped");
+            string tooMany = raw; for (int i = 0; i < 5; i++) tooMany = QuoteJson(tooMany);
+            Check(JsonTools.Process(tooMany, false).Count == 0, "outer decoding has a bounded depth");
+            var mixed = JsonTools.Process("prefix {\"value\":1} suffix", false);
+            Check(mixed.Count == 1 && mixed.Pieces.Count == 3 && mixed.Warning == null, "mixed-log extraction is not changed");
+            using (var viewer = Open(QuoteJson(raw)))
+            {
+                var box = Box(viewer); string before = box.Text;
+                Check(before.Replace("\r\n", "\n") == expected.Replace("\r\n", "\n") && (string)Field(viewer, "statusKind") == "warn", "viewer shows complete decoded JSON with an explicit notice");
+                Call(viewer, "Reprocess", false, true);
+                Check(box.Text != before && box.Text.Contains("example.invalid"), "decoded selection can expand its nested JSON");
+                Call(viewer, "Undo"); Check(box.Text == before, "nested expansion still undoes after selection decoding");
+                VerifyRoot(viewer);
+            }
+        }
+        static SelectionCapture.Result SimulateCopy(uint before, Func<int, uint> sequence, Func<int, string> text, out int ticks, out int reads)
+        {
+            int tick = 0, count = 0;
+            var task = SelectionCapture.ReadCopiedTextAsync(before, () => sequence(tick), () => { count++; return text(tick); },
+                ms => { Check(ms == 25, "copy wait is asynchronous and bounded"); tick++; return System.Threading.Tasks.Task.FromResult(0); });
+            var result = task.GetAwaiter().GetResult(); ticks = tick; reads = count; return result;
+        }
+        static void SelectionCaptureTests()
+        {
+            int ticks, reads;
+            var absent = SimulateCopy(50, t => 50, t => "old unrelated clipboard", out ticks, out reads);
+            Check(absent.Text == null && ticks == 80 && reads == 0, "unchanged clipboard never supplies stale text");
+            const string full = "{\"code\":200,\"text\":\"中文 😀\",\"nested\":\"{\\\"n\\\":1}\"}";
+            var delayed = SimulateCopy(50, t => t < 3 ? 50u : 51u, t => t < 14 ? null : full, out ticks, out reads);
+            Check(delayed.Text == full && delayed.Sequence == 51 && ticks >= 14 && reads > 1, "delayed rendering and busy/empty clipboard are retried beyond the old 40ms read");
+            var formats = SimulateCopy(50, t => t < 3 ? 51u : t < 6 ? 52u : 53u, t => full, out ticks, out reads);
+            Check(formats.Text == full && formats.Sequence == 53 && ticks >= 9 && reads == 1, "wait for all formats to settle before reading text");
+            bool changed = false;
+            var changedWhileReading = SelectionCapture.ReadCopiedTextAsync(50, () => changed ? 52u : 51u,
+                () => { if (!changed) { changed = true; return "partial"; } return full; }, ms => System.Threading.Tasks.Task.FromResult(0)).GetAwaiter().GetResult();
+            Check(changedWhileReading.Text == full && changedWhileReading.Sequence == 52, "a version change during GetText discards that result and retries");
+            var wrappedSequence = SimulateCopy(uint.MaxValue, t => 0u, t => full, out ticks, out reads);
+            Check(wrappedSequence.Text == full && wrappedSequence.Sequence == 0, "clipboard sequence wraparound is supported");
+        }
+        sealed class FrameWindow : NativeWindow, IDisposable
+        {
+            public readonly AnimationFramePump Pump = new AnimationFramePump();
+            public int Frames;
+            public FrameWindow() { CreateHandle(new CreateParams { Parent = new IntPtr(-3) }); }
+            protected override void WndProc(ref Message message)
+            {
+                if (message.Msg == AnimationFramePump.MessageId)
+                { if (Pump.Accept(message.WParam)) Frames++; return; }
+                base.WndProc(ref message);
+            }
+            public void Dispose() { Pump.Dispose(); DestroyHandle(); }
+        }
+        static void FrameLifecycleTests()
+        {
+            using (var sink = new FrameWindow())
+            {
+                sink.Pump.Start(sink.Handle, 8);
+                var watch = Stopwatch.StartNew();
+                while (sink.Frames < 3 && watch.ElapsedMilliseconds < 2000) { Application.DoEvents(); System.Threading.Thread.Sleep(1); }
+                Check(sink.Frames >= 3, "native frame clock delivers repeated UI messages");
+                var first = Field(sink.Pump, "run"); int oldId = (int)first.GetType().GetField("Id").GetValue(first);
+                for (int i = 0; i < 25; i++) { sink.Pump.Stop(); sink.Pump.Start(sink.Handle, 8); }
+                Check(!sink.Pump.Accept((IntPtr)oldId), "restarting never accepts an old animation message");
+                var current = Field(sink.Pump, "run");
+                System.Threading.Thread.Sleep(55);
+                Check((int)current.GetType().GetField("Pending").GetValue(current) <= 1, "even a stalled UI has at most one native frame queued");
+                sink.Pump.Stop(); int stopped = sink.Frames;
+                for (int i = 0; i < 5; i++) { Application.DoEvents(); System.Threading.Thread.Sleep(2); }
+                Check(sink.Frames == stopped && Field(sink.Pump, "run") == null, "idle pump does not deliver accepted frames");
+                sink.Pump.Dispose(); sink.Pump.Dispose();
+                bool rejected = false; try { sink.Pump.Start(sink.Handle, 16); } catch (ObjectDisposedException) { rejected = true; }
+                Check(rejected, "disposed pump cannot restart a worker or use released handles");
+            }
+            string source = "{\"items\":[" + new string(' ', 5000) + "1,2,3]}";
+            using (var viewer = Open(source))
+            {
+                var box = Box(viewer);
+                // 足够长的多行文档，避免光标操作或滚动边界提前结束动画。
+                box.Text = "{\n\"items\":[\n" + string.Join(",\n", new string('1', 200).ToCharArray()) + "\n]}";
+                box.Select(0, 0); box.ScrollPos = Point.Empty;
+                ((ToolStripTextBox)Field(viewer, "search")).Text = "1";
+                typeof(JsonViewer).GetField("domVersion", Private).SetValue(viewer, -1);
+                Call(box, "Wheel", -120);
+                if (box.IsSmoothScrolling)
+                {
+                    Call(viewer, "UpdatePath"); Call(viewer, "UpdateMatches", false); Call(viewer, "HoverAt", new Point(12, 12));
+                    Check((int)Field(viewer, "domVersion") == -1 && ((Timer)Field(viewer, "pathTimer")).Enabled,
+                        "DOM/path work waits until scrolling is idle");
+                    Check(((Timer)Field(viewer, "matchTimer")).Enabled && (int)Field(viewer, "tipStart") == -2,
+                        "search and hover decoding cannot block an animation frame");
+                    box.StopSmooth(); Call(viewer, "UpdatePath"); Call(viewer, "UpdateMatches", false);
+                    Check((int)Field(viewer, "domVersion") == (int)Field(viewer, "textVersion") && box.Highlights.Count == 200,
+                        "deferred path and search remain correct after animation ends");
+                }
+            }
+        }
+
 
         static Dictionary<int, int> ExpectedPairs(JNode node)
         {
@@ -630,6 +906,196 @@ namespace JsonRightClick
                 Check(!b.TryGetScopeGuide(out guide), "leaving a bracket clears its guide");
             }
         }
+
+        static void CheckAdjacentCaretGuide(JsonViewer viewer, FoldRegion region, int caret, string scenario)
+        {
+            var box = Box(viewer);
+            int plain = box.Text.IndexOf("value", StringComparison.Ordinal);
+            box.Select(plain, 0); // 先离开括号，不能复用上一轮残留的配对状态。
+            box.Select(caret, 0);
+            CodeBox.ScopeGuide guide;
+            Check(box.SelectionStart == caret && box.SelectionLength == 0 && box.BracketOpen == region.Open && box.BracketClose == region.Close,
+                scenario + ": insertion caret alone selects its adjacent bracket pair");
+            Check(box.TryGetScopeGuide(out guide), scenario + ": both gutter and text scope guides have visible geometry");
+            // 原生鼠标命中可能是括号右边的换行/逗号。MouseUp 不能把 SelectionChanged 已找到的配对清掉。
+            Point hit = box.CharPosition(caret);
+            Call(box, "OnMouseUp", new MouseEventArgs(MouseButtons.Left, 1, hit.X, hit.Y + box.LineHeight / 2, 0));
+            Check(box.BracketOpen == region.Open && box.BracketClose == region.Close && box.TryGetScopeGuide(out guide),
+                scenario + ": mouse release preserves the guide even when hit testing returns the adjacent character");
+        }
+        static void AdjacentCaretGuideTests()
+        {
+            using (var viewer = Open("{\"outer\":{\"items\":[{\"value\":1},{\"value\":2}],\"tail\":true},\"plain\":\"{[ignored]}\"}"))
+            {
+                var box = Box(viewer); string original = box.Text, rtf = box.Rtf; bool undo = box.CanUndo;
+                var regions = new List<FoldRegion>(box.Folding.Regions);
+                foreach (var region in regions)
+                {
+                    CheckAdjacentCaretGuide(viewer, region, region.Open, "before opening bracket");
+                    CheckAdjacentCaretGuide(viewer, region, region.Open + 1, "after opening bracket");
+                    CheckAdjacentCaretGuide(viewer, region, region.Close, "before closing bracket");
+                    CheckAdjacentCaretGuide(viewer, region, region.Close + 1, "after closing bracket");
+                }
+                // 真实鼠标消息：字符左半边/右半边落在两个不同的输入光标位置。
+                var child = regions.Find(r => r.Open > 0 && original[r.Open] == '{');
+                foreach (int bracket in new[] { child.Open, child.Close })
+                    foreach (bool right in new[] { false, true })
+                    {
+                        int plain = original.IndexOf("value", StringComparison.Ordinal); box.Select(plain, 0);
+                        box.ScrollPos = Point.Empty;
+                        Point point = box.CharPosition(bracket);
+                        point.Offset(right ? box.CharacterWidth * 3 / 4 : box.CharacterWidth / 4, box.LineHeight / 2);
+                        IntPtr location = (IntPtr)((point.Y << 16) | (point.X & 0xFFFF));
+                        Native.SendMessage(box.Handle, 0x0201, (IntPtr)1, location);
+                        Native.SendMessage(box.Handle, 0x0202, IntPtr.Zero, location);
+                        Check(box.SelectionLength == 0 && box.SelectionStart == bracket + (right ? 1 : 0),
+                            "native mouse click places the insertion caret on the requested side");
+                        Check(box.BracketOpen == child.Open && box.BracketClose == child.Close,
+                            "native click on either half of opening/closing brackets keeps its scope");
+                    }
+                box.Select(child.Open, 0); box.Focus();
+                Native.SendMessage(box.Handle, 0x0100, (IntPtr)Keys.Right, IntPtr.Zero);
+                Native.SendMessage(box.Handle, 0x0101, (IntPtr)Keys.Right, IntPtr.Zero);
+                Check(box.SelectionStart == child.Open + 1 && box.BracketOpen == child.Open && box.BracketClose == child.Close,
+                    "native right arrow moves past opening bracket without clearing its scope");
+                box.Select(child.Close + 1, 0);
+                Native.SendMessage(box.Handle, 0x0100, (IntPtr)Keys.Left, IntPtr.Zero);
+                Native.SendMessage(box.Handle, 0x0101, (IntPtr)Keys.Left, IntPtr.Zero);
+                Check(box.SelectionStart == child.Close && box.BracketOpen == child.Open && box.BracketClose == child.Close,
+                    "native left arrow moves before closing bracket without clearing its scope");
+                box.Select(child.Open + 1, 0); Call(viewer, "UpdateBrackets", original.Length - 1);
+                Check(box.BracketOpen == child.Open && box.BracketClose == child.Close, "an unrelated mouse hit cannot override the adjacent insertion caret scope");
+                int ignored = original.IndexOf("{[ignored]}", StringComparison.Ordinal);
+                foreach (int caret in new[] { ignored, ignored + 1, ignored + 2, ignored + 10, ignored + 11 })
+                { box.Select(caret, 0); Check(box.BracketOpen == -1, "string-literal bracket adjacency never creates a scope"); }
+                box.Select(child.Open, 2); CodeBox.ScopeGuide guide;
+                Check(box.BracketOpen == -1 && !box.TryGetScopeGuide(out guide), "an ordinary text selection still clears the caret guide");
+                Check(box.Text == original && box.Rtf == rtf && box.CanUndo == undo && !(bool)Field(viewer, "edited"),
+                    "caret and mouse scope changes do not mutate text, formatting or undo");
+            }
+            using (var viewer = Open("{\"value\":\"{\\\"items\\\":[{\\\"value\\\":1}]}\",\"tail\":0}"))
+            {
+                Call(viewer, "Reprocess", false, true);
+                var box = Box(viewer); var region = box.Folding.Regions.Find(r => box.Text[r.Open] == '[');
+                Check(region != null, "nested string expansion creates a real array scope");
+                CheckAdjacentCaretGuide(viewer, region, region.Open + 1, "expanded nested array after opening bracket");
+                CheckAdjacentCaretGuide(viewer, region, region.Close + 1, "expanded nested array after closing bracket");
+                box.Select(region.Open, 0); box.FoldCurrent(true);
+                CodeBox.ScopeGuide unused;
+                Check(!box.TryGetScopeGuide(out unused), "collapsed bracket pair does not show a false multiline guide");
+                box.FoldCurrent(false);
+                CheckAdjacentCaretGuide(viewer, region, region.Close + 1, "reopened nested array after closing bracket");
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct ImePositionQuery
+        {
+            public uint Size, Character;
+            public int X, Y;
+            public uint LineHeight;
+            public int Left, Top, Right, Bottom;
+        }
+        static void QueryImePosition(CodeBox box, int message, int request, string scenario)
+        {
+            Point before = box.ScrollPos;
+            int start = box.SelectionStart, length = box.SelectionLength, notifications = 0;
+            Action changed = delegate { notifications++; }; box.ViewportChanged += changed;
+            var query = new ImePositionQuery { Size = (uint)Marshal.SizeOf(typeof(ImePositionQuery)) };
+            IntPtr memory = Marshal.AllocHGlobal((int)query.Size);
+            try
+            {
+                Marshal.StructureToPtr(query, memory, false);
+                IntPtr result = Native.SendMessage(box.Handle, message, (IntPtr)request, memory);
+                Check(box.ScrollPos == before, scenario + ": IME position-only query cannot scroll back to an old caret");
+                Check(box.SelectionStart == start && box.SelectionLength == length, scenario + ": IME query cannot reselect text or move the caret");
+                Check(notifications == 0, scenario + ": temporary engine movement cannot invalidate viewport listeners");
+                if (result != IntPtr.Zero)
+                {
+                    var response = (ImePositionQuery)Marshal.PtrToStructure(memory, typeof(ImePositionQuery));
+                    Point expected = box.PointToScreen(box.CharPosition(start));
+                    Check(Math.Abs((long)response.Y - expected.Y) <= box.LineHeight,
+                        scenario + ": returned IME screen coordinates correspond to the restored viewport");
+                }
+            }
+            finally { Marshal.FreeHGlobal(memory); box.ViewportChanged -= changed; }
+        }
+        static void InactiveScrollActivationTests()
+        {
+            var source = new StringBuilder("{\"items\":[");
+            for (int i = 0; i < 1800; i++)
+            { if (i > 0) source.Append(','); source.Append("{\"id\":").Append(i).Append(",\"value\":\"synthetic 中文\"}"); }
+            source.Append("]}");
+            using (var viewer = Open(source.ToString()))
+            using (var other = new Form { Size = new Size(260, 120), ShowInTaskbar = false })
+            using (var input = new TextBox { Dock = DockStyle.Fill })
+            {
+                other.Controls.Add(input); var box = Box(viewer); string original = box.Text;
+                int imeMessage = (int)typeof(CodeBox).GetField("ImeQueryPosition", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+                foreach (bool oldCaretBelow in new[] { false, true })
+                {
+                    Native.ForceForeground(viewer.Handle); box.Focus();
+                    int old = oldCaretBelow ? original.LastIndexOf("synthetic", StringComparison.Ordinal) : original.IndexOf("synthetic", StringComparison.Ordinal);
+                    box.Select(old, 4); box.ScrollToCaret();
+                    other.Show(); Native.ForceForeground(other.Handle); input.Focus(); Application.DoEvents();
+                    Check(!box.Focused, "test really moves the input focus to a different window");
+                    int version = (int)Field(viewer, "textVersion"); bool undo = box.CanUndo;
+                    Point initial = box.ScrollPos;
+                    if (SystemInformation.MouseWheelScrollLines != 0)
+                    {
+                        for (int i = 0; i < 8; i++) Call(box, "Wheel", oldCaretBelow ? 120 : -120);
+                        DrainScroll(box);
+                        Check(box.ScrollPos != initial && !box.Focused, "hover wheel browsing moves the inactive viewport without stealing input focus");
+                    }
+                    box.ScrollPos = new Point(0, oldCaretBelow ? 1200 : 70003); // 包括 16 位以上的像素坐标。
+                    Point browsed = box.ScrollPos;
+                    QueryImePosition(box, imeMessage, 1, oldCaretBelow ? "old caret below viewport" : "old caret above viewport");
+                    QueryImePosition(box, 0x0288, 6, "standard IMR_QUERYCHARPOSITION");
+                    Native.SendMessage(box.Handle, 0x0021, viewer.Handle, (IntPtr)((0x0201 << 16) | 1));
+                    Check(box.ScrollPos == browsed, "mouse activation preserves the currently browsed viewport before hit testing");
+                    viewer.Activate(); Native.ForceForeground(viewer.Handle); box.Focus(); Application.DoEvents();
+                    Check(box.Focused && box.ScrollPos == browsed, "returning to the viewer does not jump to the old selection");
+                    Check(box.SelectionStart == old && box.SelectionLength == 4 && box.Text == original && box.CanUndo == undo
+                        && (int)Field(viewer, "textVersion") == version, "activation keeps source, old selection, undo and structural caches intact");
+                    int hit = box.CharIndexAt(new Point(80, box.ClientSize.Height / 2));
+                    box.Select(hit, 0);
+                    Check(box.SelectionStart == hit && box.ScrollPos == browsed && hit != old, "new caret placement is based on the browsed viewport, not the old viewport");
+                    System.Threading.Thread.Sleep(25); Application.DoEvents();
+                    Check(box.ScrollPos == browsed, "delayed position queries cannot create a second jump after caret placement");
+                    box.Select(old, 0); box.ScrollToCaret();
+                    Check(Math.Abs(box.CharPosition(old).Y) <= box.ClientSize.Height,
+                        "explicit ScrollToCaret navigation is still allowed to reveal a target");
+                    box.Select(hit, 0); box.ScrollToCaret(); Native.SendMessage(box.Handle, 0x0102, (IntPtr)'x', IntPtr.Zero);
+                    Check(box.Text != original && box.CanUndo, "actual keyboard input still edits normally after focus restoration");
+                    box.Undo(); Check(box.Text == original, "keyboard input after activation keeps native undo intact");
+                }
+                box.Select(0, 0); box.ScrollPos = new Point(0, 70003);
+                box.FoldAll(true); QueryImePosition(box, imeMessage, 1, "folded document");
+                box.FoldAll(false); box.Select(0, 0); box.ScrollPos = new Point(0, 70003);
+                Native.SendMessage(box.Handle, 0x010D, IntPtr.Zero, IntPtr.Zero);
+                Check((bool)Field(box, "imeComposing"), "active IME composition is not treated as a passive viewport read");
+                Native.SendMessage(box.Handle, 0x010E, IntPtr.Zero, IntPtr.Zero);
+                Check(!(bool)Field(box, "imeComposing"), "IME end releases composition state");
+                Native.SendMessage(box.Handle, 0x010D, IntPtr.Zero, IntPtr.Zero);
+                other.Activate(); input.Focus(); Application.DoEvents();
+                Check(!(bool)Field(box, "imeComposing"), "losing focus cannot leave a stale composition state");
+            }
+            using (var viewer = Open("{\"long\":\"" + new string('x', 3000) + "\",\"tail\":[1,2]}"))
+            {
+                var box = Box(viewer); ((ToolStripButton)Field(viewer, "btnWrap")).Checked = false;
+                box.Select(0, 0); box.ScrollPos = new Point(260, 0);
+                Check(box.ScrollPos.X > 0, "horizontal preservation test actually scrolls a nonwrapped document");
+                int imeMessage = (int)typeof(CodeBox).GetField("ImeQueryPosition", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+                QueryImePosition(box, imeMessage, 1, "horizontal offscreen caret");
+                QueryImePosition(box, 0x0288, 6, "horizontal standard IME request");
+            }
+            using (var viewer = Open(""))
+            {
+                var box = Box(viewer); box.Focus();
+                Check(box.ScrollPos == Point.Empty && box.SelectionStart == 0, "empty-editor focus still initializes normally");
+            }
+        }
+
 
         static void DrainScroll(CodeBox box)
         {

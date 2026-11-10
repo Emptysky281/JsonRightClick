@@ -842,11 +842,15 @@ namespace JsonRightClick
             return s;
         }
 
-        public bool Restore(IntPtr owner)
+        public bool Restore(IntPtr owner) { return Restore(owner, null); }
+        public bool RestoreIfUnchanged(IntPtr owner, uint sequence) { return Restore(owner, sequence); }
+        bool Restore(IntPtr owner, uint? sequence)
         {
             if (items.Count == 0 || !Open(owner)) return false;
             try
             {
+                // 在持有剪贴板锁时检查，关闭“检查之后又复制”的竞态；不覆盖用户的新复制。
+                if (sequence.HasValue && Native.GetClipboardSequenceNumber() != sequence.Value) return false;
                 Native.EmptyClipboard();
                 foreach (var it in items) SetBytes(it.Format, it.Data);
                 // 不进入 Win+V 剪贴板历史和云剪贴板；剪贴板管理工具（如 Ditto）也认这个标记

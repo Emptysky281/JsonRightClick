@@ -446,7 +446,7 @@ namespace JsonRightClick
 
         void OnViewportChanged()
         {
-            if (!IsHandleCreated || IsDisposed) return;
+            if (!IsHandleCreated || IsDisposed || viewportReadDepth > 0) return;
             Point position = ScrollPos;
             int first = (int)Native.SendMessage(Handle, 0x00CE /* EM_GETFIRSTVISIBLELINE */, IntPtr.Zero, IntPtr.Zero);
             if (viewportKnown && position == lastScroll && first == lastFirstLine) return;
@@ -478,7 +478,7 @@ namespace JsonRightClick
 
         public int LineHeight { get { EnsureEditorMetrics(); return editorLineHeight; } }
 
-        protected override void WndProc(ref Message m)
+        void ProcessEditorMessage(ref Message m)
         {
             if (m.Msg == AnimationFramePump.MessageId)
             {
@@ -574,7 +574,6 @@ namespace JsonRightClick
             {
                 animating = true;
                 AnimationInterval = FrameInterval();
-                Native.timeBeginPeriod(1);
                 clock.Restart();
                 anim.Start(Handle, AnimationInterval);
             }
@@ -599,9 +598,20 @@ namespace JsonRightClick
             int next = (int)Math.Round(current);
             if (next != actual.Y)
             {
-                ScrollPos = new Point(actual.X, next);
-                int reached = ScrollPos.Y;
-                if (reached != next) { current = target = reached; pixelRemainder = 0; }
+                // 有叠加标记时原本就需要整屏重绘。先合并原生滚动及其通知，再呈现一次，
+                // 避免 EM_SETSCROLLPOS 内部同步绘制一遍，Invalidate/Update 又绘制一遍。
+                bool batch = Highlights.Count > 0 || bracketOpen >= 0 || folding.CollapsedCount > 0;
+                if (batch) Native.SendMessage(Handle, 0x000B /* WM_SETREDRAW */, IntPtr.Zero, IntPtr.Zero);
+                try
+                {
+                    ScrollPos = new Point(actual.X, next);
+                    int reached = ScrollPos.Y;
+                    if (reached != next) { current = target = reached; pixelRemainder = 0; }
+                }
+                finally
+                {
+                    if (batch) { Native.SendMessage(Handle, 0x000B, (IntPtr)1, IntPtr.Zero); Invalidate(); }
+                }
                 // 合并帧消息不允许饿死 WM_PAINT；每帧至多刷新一次文字和对应侧栏。
                 Update();
                 if (!folding.Gutter.IsDisposed) folding.Gutter.Update();
@@ -613,7 +623,6 @@ namespace JsonRightClick
             if (!animating) return;
             pixelRemainder = target - Math.Round(target);
             animating = false; anim.Stop(); clock.Stop();
-            Native.timeEndPeriod(1);
         }
 
         protected override void Dispose(bool disposing)
