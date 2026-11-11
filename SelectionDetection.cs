@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Drawing;
+using System.Text;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -71,6 +72,8 @@ namespace JsonRightClick
         static readonly SelectionProbeRunner runner = new SelectionProbeRunner();
         [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW")]
         static extern IntPtr GetSelection(IntPtr handle, uint message, ref uint start, ref uint end, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode)]
+        static extern IntPtr ReadEditText(IntPtr handle, uint message, IntPtr capacity, StringBuilder text, uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
         static extern int GetStyle(IntPtr handle, int index);
         [DllImport("user32.dll")]
@@ -78,6 +81,7 @@ namespace JsonRightClick
         [DllImport("user32.dll")]
         static extern bool IsChild(IntPtr parent, IntPtr child);
 
+        // 是否有真实文字选区，与选中文字是否为 JSON 无关；不能把解析校验加到显示条件里。
         public static bool ShouldShow(Sel selection) { return selection == Sel.Yes; }
         public static Task<Sel> Begin(SelectionTarget target)
         { return runner.Run(() => Check(target)); }
@@ -112,6 +116,26 @@ namespace JsonRightClick
             if (start == uint.MaxValue || end == uint.MaxValue) return Sel.Unknown;
             return start != end ? Sel.Yes : Sel.No;
         }
+        internal static string NativeSelectedText(IntPtr handle)
+        {
+            string cls = Native.ClassName(handle);
+            // 标准 Edit 的 WM_GETTEXT 和 EM_GETSEL 使用相同的 CRLF 位置。RichEdit 的
+            // 换行/隐藏字符坐标规则不同，必须交给其文本提供程序，不能拿字符串下标猜。
+            if (cls != "Edit" && !cls.StartsWith("WindowsForms10.EDIT", StringComparison.OrdinalIgnoreCase)) return null;
+            if (NativeSelection(handle) != Sel.Yes) return null;
+            uint start = uint.MaxValue, end = uint.MaxValue; IntPtr ignored, length;
+            if (GetSelection(handle, 0x00B0, ref start, ref end, 2, 150, out ignored) == IntPtr.Zero || start == end) return null;
+            if (!Native.Send(handle, 0x000E /* WM_GETTEXTLENGTH */, out length)) return null;
+            long count = length.ToInt64();
+            if (count <= 0 || count > SelectedTextReader.MaxCharacters) return null;
+            var text = new StringBuilder((int)count + 1);
+            if (ReadEditText(handle, 0x000D /* WM_GETTEXT */, (IntPtr)text.Capacity, text, 2, 150, out ignored) == IntPtr.Zero) return null;
+            uint checkStart = uint.MaxValue, checkEnd = uint.MaxValue;
+            if (GetSelection(handle, 0x00B0, ref checkStart, ref checkEnd, 2, 150, out ignored) == IntPtr.Zero
+                || start != checkStart || end != checkEnd || end > text.Length || start > end) return null;
+            return text.ToString((int)start, (int)(end - start));
+        }
+
         internal static bool NonEmptyTextRange(int endpointOrder, string sample)
         {
             // 光标是退化范围。图标/图片对象的占位符不等于选中了可解析的文字。
@@ -143,7 +167,7 @@ namespace JsonRightClick
         internal static bool ContainsTextHit(int startComparedToHit, int endComparedToHit)
         { return startComparedToHit <= 0 && endComparedToHit > 0; }
 
-        static Sel ElementSelection(AutomationElement element, Point? point, out bool blocked)
+        static Sel ElementSelection(AutomationElement element, Point? point, out bool blocked, Action<string> capture = null)
         {
             blocked = false;
             var info = element.Current;
@@ -177,11 +201,17 @@ namespace JsonRightClick
                         }
                     }
                 }
+                if (capture != null)
+                {
+                    // 在发送 Esc / Ctrl+C 之前读取同一个已验证范围的完整内容；不按 JSON 形状筛选。
+                    string full = range.GetText(SelectedTextReader.MaxCharacters + 1);
+                    if (SelectedTextReader.Accept(full)) capture(full);
+                }
                 return Sel.Yes;
             }
             return Sel.No;
         }
-        static Sel AutomationSelection(AutomationElement element, IntPtr root, Point? point, out bool blocked)
+        static Sel AutomationSelection(AutomationElement element, IntPtr root, Point? point, out bool blocked, Action<string> capture = null)
         {
             blocked = false;
             if (element == null || !OwnedBy(element, root)) return Sel.Unknown;
@@ -190,7 +220,7 @@ namespace JsonRightClick
             {
                 int handle = element.Current.NativeWindowHandle;
                 if (handle != 0 && Native.Root(new IntPtr(handle)) != root) break;
-                var result = ElementSelection(element, point, out blocked);
+                var result = ElementSelection(element, point, out blocked, capture);
                 if (blocked || result == Sel.Yes) return result;
                 supported |= result == Sel.No;
                 // HTML 文字叶节点/装饰子元素可能无选区；选区实际由父 Document/编辑器维护。
@@ -199,7 +229,7 @@ namespace JsonRightClick
             }
             return supported ? Sel.No : Sel.Unknown;
         }
-        static Sel DescendantSelection(AutomationElement host, IntPtr root, Point point, out bool blocked)
+        static Sel DescendantSelection(AutomationElement host, IntPtr root, Point point, out bool blocked, Action<string> capture = null)
         {
             blocked = false;
             if (host == null || !OwnedBy(host, root)) return Sel.Unknown;
@@ -211,7 +241,7 @@ namespace JsonRightClick
                 var item = stack.Pop(); var element = item.Key;
                 var bounds = element.Current.BoundingRectangle;
                 if (element.Current.IsOffscreen || !bounds.Contains(point.X, point.Y)) continue;
-                var result = ElementSelection(element, point, out blocked);
+                var result = ElementSelection(element, point, out blocked, capture);
                 if (blocked || result == Sel.Yes) return result;
                 if (item.Value >= 6) continue;
                 var child = TreeWalker.RawViewWalker.GetFirstChild(element);
@@ -224,44 +254,56 @@ namespace JsonRightClick
             }
             return Sel.Unknown;
         }
-        internal static Sel Check(SelectionTarget target)
+        internal static Sel Check(SelectionTarget target, Action<string> capture = null)
         {
             LastInfo = "no-target";
             if (target == null || !target.IsCurrent || !IsWindowVisible(target.Control)) return Sel.Unknown;
+            bool captured = false;
+            Action<string> read = capture == null ? null : (Action<string>)(value => { if (SelectedTextReader.Accept(value)) { captured = true; capture(value); } });
             var result = NativeSelection(target.Control);
-            if (result != Sel.Unknown) return result;
+            if (result == Sel.No || (result == Sel.Yes && read == null)) return result;
+            if (result == Sel.Yes)
+            {
+                string value = NativeSelectedText(target.Control);
+                if (SelectedTextReader.Accept(value)) { read(value); return Sel.Yes; }
+            }
             if (target.Focus != IntPtr.Zero && target.Focus != target.Control && IsChild(target.Focus, target.Control))
             {
                 result = NativeSelection(target.Focus);
-                if (result != Sel.Unknown) return result;
+                if (result == Sel.No || (result == Sel.Yes && read == null)) return result;
+                if (result == Sel.Yes)
+                {
+                    string value = NativeSelectedText(target.Focus);
+                    if (SelectedTextReader.Accept(value)) { read(value); return Sel.Yes; }
+                }
             }
             bool blocked;
             // Chrome/Electron/Firefox 可能只有 MSAA/IAccessible2，没有 UIA TextPattern。
-            result = LegacyTextSelection.AtPoint(target.Root, target.Point, out blocked);
-            if (blocked || result == Sel.Yes) { LastInfo += " ia2-point"; return result; }
-            result = LegacyTextSelection.AtWindow(target.Control, target.Root, target.Point, out blocked);
-            if (blocked || result == Sel.Yes) { LastInfo += " ia2-window"; return result; }
+            result = LegacyTextSelection.AtPoint(target.Root, target.Point, out blocked, read);
+            if (blocked || (result == Sel.Yes && (read == null || captured))) { LastInfo += " ia2-point"; return result; }
+            result = LegacyTextSelection.AtWindow(target.Control, target.Root, target.Point, out blocked, read);
+            if (blocked || (result == Sel.Yes && (read == null || captured))) { LastInfo += " ia2-window"; return result; }
             try
             {
-                result = AutomationSelection(AutomationElement.FromPoint(new System.Windows.Point(target.Point.X, target.Point.Y)), target.Root, target.Point, out blocked);
-                if (blocked || result == Sel.Yes) return result;
+                result = AutomationSelection(AutomationElement.FromPoint(new System.Windows.Point(target.Point.X, target.Point.Y)), target.Root, target.Point, out blocked, read);
+                if (blocked || (result == Sel.Yes && (read == null || captured))) return result;
             }
             catch { }
             try
             {
                 // 从实际原控件定位虚拟 Document；只在命中点所在分支中有界查找，不扫描整窗其他编辑器。
                 var host = AutomationElement.FromHandle(target.Control);
-                result = AutomationSelection(host, target.Root, target.Point, out blocked);
-                if (blocked || result == Sel.Yes) return result;
-                result = DescendantSelection(host, target.Root, target.Point, out blocked);
-                if (blocked || result == Sel.Yes) return result;
+                result = AutomationSelection(host, target.Root, target.Point, out blocked, read);
+                if (blocked || (result == Sel.Yes && (read == null || captured))) return result;
+                result = DescendantSelection(host, target.Root, target.Point, out blocked, read);
+                if (blocked || (result == Sel.Yes && (read == null || captured))) return result;
             }
             catch { }
             try
             {
                 // WPF/浏览器的焦点可能是没有 HWND 的虚拟文本元素；矩形和原窗口归属仍须同时匹配。
-                result = AutomationSelection(AutomationElement.FocusedElement, target.Root, target.Point, out blocked);
-                if (blocked || result == Sel.Yes) return result;
+                result = AutomationSelection(AutomationElement.FocusedElement, target.Root, target.Point, out blocked, read);
+                if (blocked || (result == Sel.Yes && (read == null || captured))) return result;
             }
             catch { }
             return Sel.Unknown;

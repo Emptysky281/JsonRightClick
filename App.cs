@@ -436,7 +436,7 @@ namespace JsonRightClick
         DateTime shownAt;
         bool busy, floatEnabled, restoreClip, hotkeyOk;
         int gen;           // 每次右键/点击递增，用于作废过期的异步检测
-        SelectionTarget rightClickTarget;
+        SelectionTarget rightClickTarget, shownSelection;
         uint rightClickClipboardSequence, targetClipboardSequence;
 
         public TrayContext()
@@ -754,6 +754,7 @@ namespace JsonRightClick
                 if (!SelectionProbe.ShouldShow(selection)) return; // 未知、超时、不支持均不弹出。
 
                 targetRoot = target.Root;
+                shownSelection = target;
                 targetClipboardSequence = clipboardSequence;
                 floatBtn.ShowAt(pt);
                 hooks.ButtonRect = floatBtn.ScreenBounds;
@@ -836,9 +837,22 @@ namespace JsonRightClick
                     return;
                 }
 
+                Task<string> directRead = null;
+                if (fromButton && shownSelection != null)
+                {
+                    var selected = shownSelection;
+                    // 不能先 Escape 再读取：部分编辑器/网页会在关菜单时取消原文字选区。
+                    // 直接通道取得的完整原文无需经过剪贴板，也不要求它能解析为 JSON。
+                    directRead = SelectedTextReader.ReadAsync(selected);
+                    bool opened = await SelectedTextReader.OpenBeforeCopyAsync(
+                        () => SelectedTextReader.BeforeDismissAsync(() => directRead, Task.Delay), () => selected.IsCurrent,
+                        async () => { Native.Key(Keys.Escape); await Task.Delay(40); }, value => { ShowViewer(value); });
+                    if (opened) return;
+                }
+
                 if (fromButton)
                 {
-                    Native.Key(Keys.Escape); // 关闭目标程序的右键菜单
+                    Native.Key(Keys.Escape); // 没有完整选区读数时才回退到原复制流程。
                     await Task.Delay(120);
                     if (targetRoot != IntPtr.Zero && Native.GetForegroundWindow() != targetRoot)
                     {
@@ -862,11 +876,13 @@ namespace JsonRightClick
                 Native.KeyCombo(Keys.ControlKey, Keys.C);
                 var copied = await SelectionCapture.ReadCopiedTextAsync(seq);
                 string text = copied.Text;
+                // 冷启动文本提供程序可能晚于菜单关闭才完成；复制失败时仍接住原控件的完整读数。
+                if (string.IsNullOrEmpty(text)) text = SelectedTextReader.CompletedText(directRead);
 
                 if (string.IsNullOrEmpty(text))
                 {
                     tray.ShowBalloonTip(2500, L.T("没有取到选中的文本", "No selected text"),
-                        L.T("请先选中 JSON 文本再试。也可以手动复制后双击托盘图标解析。", "Select some JSON text first, or copy it manually and double-click the tray icon."), ToolTipIcon.Warning);
+                        L.T("请先选中文字再试（无需是合法 JSON）。也可以手动复制后双击托盘图标打开。", "Select some text first (valid JSON is not required), or copy it manually and double-click the tray icon."), ToolTipIcon.Warning);
                     return;
                 }
 
@@ -882,12 +898,17 @@ namespace JsonRightClick
             return ClipboardUtil.GetText() ?? "";
         }
 
-        static void ShowViewer(string text)
+        internal static JsonViewer ShowViewer(string text)
         {
-            var v = new JsonViewer(text);
+            // 入口只要求取得文字，不在这里按 JSON 形状/解析成功与否拒绝选区。
+            // 无法转换的输入由查看窗口完整展示原文，用户可以编辑后重试。
+            var v = new JsonViewer(text ?? "");
             v.Show();
+            v.BringToFront();
             v.Activate();
-            Native.SetForegroundWindow(v.Handle);
+            // 悬浮按钮不抢焦点且低级钩子吞掉点击，普通 SetForegroundWindow 可能被系统拒绝。
+            Native.ForceForeground(v.Handle);
+            return v;
         }
 
         static void ShowHelp()

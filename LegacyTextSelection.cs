@@ -60,7 +60,7 @@ namespace JsonRightClick
         internal static bool OffsetWithinSelection(int start, int end, int offset)
         { return ValidOffsets(start, end) && offset >= Math.Min(start, end) && offset <= Math.Max(start, end); }
 
-        static Sel ReadChain(IAccessible accessible, IntPtr root, Point point, out bool blocked)
+        static Sel ReadChain(IAccessible accessible, IntPtr root, Point point, out bool blocked, Action<string> capture)
         {
             blocked = false; bool supported = false;
             try
@@ -97,7 +97,15 @@ namespace JsonRightClick
                                     int from = Math.Min(start, end), to = Math.Max(start, end);
                                     string sample;
                                     if (text.Text(from, from + (int)Math.Min(32L, (long)to - from), out sample) >= 0
-                                        && SelectionProbe.NonEmptyTextRange(-1, sample)) return Sel.Yes;
+                                        && SelectionProbe.NonEmptyTextRange(-1, sample))
+                                    {
+                                        if (capture != null && (long)to - from <= SelectedTextReader.MaxCharacters)
+                                        {
+                                            string full;
+                                            if (text.Text(from, to, out full) >= 0 && full != null && full.Length == to - from && SelectedTextReader.Accept(full)) capture(full);
+                                        }
+                                        return Sel.Yes;
+                                    }
                                 }
                             }
                         }
@@ -112,7 +120,7 @@ namespace JsonRightClick
             finally { Release(accessible); }
             return supported ? Sel.No : Sel.Unknown;
         }
-        public static Sel AtPoint(IntPtr root, Point point, out bool blocked)
+        public static Sel AtPoint(IntPtr root, Point point, out bool blocked, Action<string> capture = null)
         {
             blocked = false; IAccessible accessible = null; object child;
             try
@@ -125,12 +133,12 @@ namespace JsonRightClick
                     if (item != null) { Release(accessible); accessible = item; }
                 }
                 var owned = accessible; accessible = null; // 所有权交给 ReadChain，异常路径也释放 RCW。
-                return ReadChain(owned, root, point, out blocked);
+                return ReadChain(owned, root, point, out blocked, capture);
             }
             catch { return Sel.Unknown; }
             finally { Release(accessible); }
         }
-        public static Sel AtWindow(IntPtr window, IntPtr root, Point point, out bool blocked)
+        public static Sel AtWindow(IntPtr window, IntPtr root, Point point, out bool blocked, Action<string> capture = null)
         {
             blocked = false; IAccessible accessible = null; Guid iid = AccessibleId;
             try
@@ -145,7 +153,7 @@ namespace JsonRightClick
                     Release(accessible); accessible = hit;
                 }
                 var owned = accessible; accessible = null; // 所有权交给 ReadChain，异常路径也释放 RCW。
-                return ReadChain(owned, root, point, out blocked);
+                return ReadChain(owned, root, point, out blocked, capture);
             }
             catch { return Sel.Unknown; }
             finally { Release(accessible); }

@@ -364,7 +364,7 @@ namespace JsonRightClick
             items.Add(sizeMenu);
 
             items.Add(new ToolStripSeparator());
-            items.Add(new ToolStripMenuItem(L.T("宽松解析（单引号、末尾逗号、True/None、注释等）"), null, delegate
+            items.Add(new ToolStripMenuItem(L.T("宽松解析（无引号键/值、单引号、末尾逗号等）"), null, delegate
             {
                 ViewSettings.Lenient = !ViewSettings.Lenient;
                 SetStatus(ViewSettings.Lenient ? L.T("已开启宽松解析，点「格式化」重新解析") : L.T("已关闭宽松解析，只接受标准 JSON"), "muted");
@@ -791,9 +791,11 @@ namespace JsonRightClick
 
         void LoadText(string text, bool minify, bool expand)
         {
+            text = text ?? "";
             lastMinify = minify;
             var r = JsonTools.Process(text, new FormatOptions { Minify = minify, Expand = expand, Lenient = ViewSettings.Lenient });
-            pieces = r.Pieces;
+            // 解析失败只影响格式化结果，不影响打开窗口；零片段时始终使用完整输入。
+            pieces = r.Count > 0 ? r.Pieces : new List<Piece> { new Piece { Text = text } };
             shownOnly = btnOnly.Checked && r.Count > 0;
             var view = JsonTools.BuildView(pieces, shownOnly);
             ShowReal(view.Text, view.JsonRanges);
@@ -805,14 +807,20 @@ namespace JsonRightClick
             {
                 bool hidden = shownOnly && pieces.Exists(p => !p.IsJson && p.Text.Trim().Length > 0);
                 string msg = r.Warning ?? L.F("已解析 {0} 段 JSON", r.Count);
-                if (expand) msg = r.Expanded > 0 ? L.F("已展开 {0} 个嵌套 JSON 字符串", r.Expanded) : L.T("没有找到内容是 JSON 的字符串");
-                SetStatus(msg + "", r.Warning != null && !expand ? "warn" : "ok");
+                if (expand)
+                {
+                    msg = r.Expanded > 0 ? L.F("已展开 {0} 个嵌套 JSON 字符串", r.Expanded) : L.T("没有找到内容是 JSON 的字符串");
+                    if (r.Warning != null) msg += L.T("；", "; ") + r.Warning;
+                }
+                SetStatus(msg + "", r.Warning != null ? "warn" : "ok");
                 titleBase = r.Count == 1 ? L.T("JSON 解析") : L.F("JSON 解析（{0} 段）", r.Count);
             }
             else
             {
-                bool empty = text.Trim().Length == 0;
-                SetStatus(empty ? L.T("在此粘贴 JSON，然后按 Ctrl+Enter 格式化") : L.T("解析失败 — ") + r.Error, empty ? "muted" : "err");
+                bool empty = text.Length == 0;
+                string message = empty ? L.T("在此粘贴任意文本，然后按 Ctrl+Enter 尝试格式化")
+                    : L.T("未识别到 JSON 对象或数组，已保留全部原文，可编辑后重试") + (string.IsNullOrEmpty(r.Error) ? "" : " — " + r.Error);
+                SetStatus(message, empty ? "muted" : "warn");
                 titleBase = L.T("JSON 解析");
             }
             UpdateTitle();

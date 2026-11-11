@@ -53,6 +53,7 @@ namespace JsonRightClick
             d["缩小"] = "Zoom out";
             d["恢复默认"] = "Reset";
             d["宽松解析（单引号、末尾逗号、True/None、注释等）"] = "Lenient parsing (single quotes, trailing commas, True/None, comments…)";
+            d["宽松解析（无引号键/值、单引号、末尾逗号等）"] = "Lenient parsing (unquoted keys/values, single quotes, trailing commas…)";
             d["已开启宽松解析，点「格式化」重新解析"] = "Lenient parsing on; click \"Format\" to re-parse";
             d["已关闭宽松解析，只接受标准 JSON"] = "Lenient parsing off; only standard JSON is accepted";
             d["设置打码字段…"] = "Masked fields…";
@@ -94,6 +95,8 @@ namespace JsonRightClick
             d["没有找到内容是 JSON 的字符串"] = "No strings containing JSON were found";
             d["JSON 解析（{0} 段）"] = "JSON Viewer ({0} fragments)";
             d["在此粘贴 JSON，然后按 Ctrl+Enter 格式化"] = "Paste JSON here, then press Ctrl+Enter to format";
+            d["在此粘贴任意文本，然后按 Ctrl+Enter 尝试格式化"] = "Paste any text here, then press Ctrl+Enter to try formatting";
+            d["未识别到 JSON 对象或数组，已保留全部原文，可编辑后重试"] = "No JSON object or array recognized; all original text is preserved. Edit and try again";
             d["解析失败 — "] = "Parse failed — ";
             d["没有找到需要打码的字段"] = "No fields to mask";
         d["已打码 {0} 个字段"] = "Masked {0} field(s)";
@@ -137,6 +140,9 @@ namespace JsonRightClick
             d["末尾多余的逗号"] = "trailing commas";
             d["应为 ',' 或 '}'"] = "expected ',' or '}'";
             d["属性名缺少引号"] = "unquoted property names";
+            d["未加引号的字符串值（按字符串推断，原始类型可能有歧义）"] = "unquoted string values (inferred as strings; original types may be ambiguous)";
+            d["未加引号的字符串含有歧义字符，请给字符串加引号"] = "ambiguous character in an unquoted value; quote the string";
+            d["缺少值，不能推断为空字符串"] = "missing value; cannot infer an empty string";
             d["数组缺少 ']'"] = "array is missing ']'";
             d["应为 ',' 或 ']'"] = "expected ',' or ']'";
             d["单引号字符串"] = "single-quoted strings";

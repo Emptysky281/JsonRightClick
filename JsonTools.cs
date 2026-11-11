@@ -34,7 +34,7 @@ namespace JsonRightClick
     {
         public bool Minify;   // 压缩为一行
         public bool Expand;   // 把值为 JSON 的字符串展开
-        public bool Lenient;  // 严格解析失败时，尝试宽松规则（单引号、末尾逗号、True/None、注释等）
+        public bool Lenient;  // 严格解析失败时尝试宽松规则；Map 表示中的无引号字符串会明确提示类型推断。
     }
 
     sealed class JsonFail : Exception
@@ -51,19 +51,20 @@ namespace JsonRightClick
     {
         const int MaxDepth = 512;
         readonly string s;
-        readonly bool minify, expand, lenient;
+        readonly bool minify, expand, lenient, mapValues;
         readonly StringBuilder sb = new StringBuilder();
         readonly HashSet<string> fixes;
         int p, depth, expanded;
+        bool unquotedKeys;
 
-        JsonFormatter(string s, int start, FormatOptions o, bool lenient, int depth, HashSet<string> fixes)
+        JsonFormatter(string s, int start, FormatOptions o, bool lenient, bool mapValues, int depth, HashSet<string> fixes)
         {
-            this.s = s; p = start; minify = o.Minify; expand = o.Expand; this.lenient = lenient; this.depth = depth; this.fixes = fixes;
+            this.s = s; p = start; minify = o.Minify; expand = o.Expand; this.lenient = lenient; this.mapValues = mapValues; this.depth = depth; this.fixes = fixes;
         }
 
         public sealed class Result
         {
-            public bool Ok;
+            public bool Ok, UnquotedKeys;
             public int End, ErrorPos, Expanded;
             public string Text, Error;
             public HashSet<string> Fixes = new HashSet<string>();
@@ -72,22 +73,32 @@ namespace JsonRightClick
         /// <summary>从 start 开始解析一个 JSON 值。先严格解析，失败且允许时再用宽松规则重试。</summary>
         public static Result Run(string s, int start, FormatOptions o, int depth)
         {
-            var r = Attempt(s, start, o, false, depth);
+            var r = Attempt(s, start, o, false, false, depth);
             if (r.Ok || !o.Lenient) return r;
-            var r2 = Attempt(s, start, o, true, depth);
-            return r2.Ok ? r2 : r;
+            var r2 = Attempt(s, start, o, true, false, depth);
+            if (r2.Ok) return r2;
+            // Map.toString 一类的展示文本不是 JSON：不仅键，字符串值也可能没引号。
+            // 只在已看到无引号属性名时启用第三步，不能把 [INFO] 或纯 JSON 拼写错误
+            // 随意解释成字符串；严格模式和已有宽松语法优先，标准 JSON 语义不变。
+            if (r2.UnquotedKeys)
+            {
+                var map = Attempt(s, start, o, true, true, depth);
+                if (map.Ok) return map;
+            }
+            return r;
         }
 
-        static Result Attempt(string s, int start, FormatOptions o, bool lenient, int depth)
+        static Result Attempt(string s, int start, FormatOptions o, bool lenient, bool mapValues, int depth)
         {
             var res = new Result();
-            var f = new JsonFormatter(s, start, o, lenient, depth, res.Fixes);
+            var f = new JsonFormatter(s, start, o, lenient, mapValues, depth, res.Fixes);
             try
             {
                 f.Value();
                 res.Ok = true; res.End = f.p; res.Text = f.sb.ToString(); res.Expanded = f.expanded;
             }
             catch (JsonFail e) { res.Error = e.Message; res.ErrorPos = e.Pos; }
+            res.UnquotedKeys = f.unquotedKeys;
             return res;
         }
 
@@ -131,6 +142,7 @@ namespace JsonRightClick
             if (c == '{') Obj();
             else if (c == '[') Arr();
             else if (c == '"' || (lenient && c == '\'')) Str(false);
+            else if (mapValues) MapScalar();
             else if (c == '-' || (c >= '0' && c <= '9') || (lenient && c == '+')) Num();
             else if (Lit("true", "true") || Lit("false", "false") || Lit("null", "null")) { }
             else if (lenient && (Lit("True", "true") || Lit("False", "false") || Lit("None", "null")
@@ -185,7 +197,83 @@ namespace JsonRightClick
             int st = p;
             while (p < s.Length && (IsIdent(s[p]) || s[p] == '-')) p++;
             sb.Append('"').Append(s, st, p - st).Append('"');
+            unquotedKeys = true;
             Fix(L.T("属性名缺少引号"));
+        }
+
+        bool TokenEquals(int start, int end, string value)
+        { return end - start == value.Length && string.CompareOrdinal(s, start, value, 0, value.Length) == 0; }
+
+        bool MapNumber(int start, int end, out int numberStart)
+        {
+            int i = start;
+            numberStart = start;
+            if (i < end && s[i] == '+') { i++; numberStart = i; }
+            else if (i < end && s[i] == '-') i++;
+            if (i >= end || !Dig(s[i])) return false;
+            if (s[i] == '0') i++; else while (i < end && Dig(s[i])) i++;
+            if (i < end && s[i] == '.')
+            {
+                i++; if (i >= end || !Dig(s[i])) return false;
+                while (i < end && Dig(s[i])) i++;
+            }
+            if (i < end && (s[i] == 'e' || s[i] == 'E'))
+            {
+                i++; if (i < end && (s[i] == '+' || s[i] == '-')) i++;
+                if (i >= end || !Dig(s[i])) return false;
+                while (i < end && Dig(s[i])) i++;
+            }
+            return i == end; // IP / 4Mbps / 12abc 必须作为整个 token 判断，不能只读数字前缀。
+        }
+
+        bool UriScheme(int start, int colon)
+        {
+            if (start == colon || !char.IsLetter(s[start])) return false;
+            for (int i = start + 1; i < colon; i++)
+                if (!char.IsLetterOrDigit(s[i]) && s[i] != '+' && s[i] != '-' && s[i] != '.') return false;
+            return true;
+        }
+
+        void MapScalar()
+        {
+            int start = p; bool uri = false;
+            while (p < s.Length)
+            {
+                char c = s[p];
+                if (c == ',' || c == '}' || c == ']' || char.IsWhiteSpace(c) || c == '\uFEFF') break;
+                if (c < 0x20 || c == '"' || c == '\'' || c == '{' || c == '[')
+                    Fail(L.T("未加引号的字符串含有歧义字符，请给字符串加引号"));
+                if (c == ':' && p + 2 < s.Length && s[p + 1] == '/' && s[p + 2] == '/' && UriScheme(start, p)) uri = true;
+                else if (c == ':' && !uri && !(p == start + 1 && char.IsLetter(s[start]) && p + 1 < s.Length && (s[p + 1] == '\\' || s[p + 1] == '/')))
+                    Fail(L.T("未加引号的字符串含有歧义字符，请给字符串加引号"));
+                if (!uri && c == '/' && p + 1 < s.Length && (s[p + 1] == '*' || s[p + 1] == '/')) break;
+                p++;
+            }
+            int end = p;
+            if (end == start) Fail(L.T("缺少值，不能推断为空字符串"));
+            if (TokenEquals(start, end, "true") || TokenEquals(start, end, "false") || TokenEquals(start, end, "null"))
+            { sb.Append(s, start, end - start); return; }
+            if (TokenEquals(start, end, "True") || TokenEquals(start, end, "False") || TokenEquals(start, end, "None")
+                || TokenEquals(start, end, "undefined") || TokenEquals(start, end, "NULL"))
+            {
+                sb.Append(TokenEquals(start, end, "True") ? "true" : TokenEquals(start, end, "False") ? "false" : "null");
+                Fix("True / False / None"); return;
+            }
+            int numberStart;
+            if (MapNumber(start, end, out numberStart))
+            {
+                if (numberStart != start) Fix(L.T("数字前的 +"));
+                sb.Append(s, numberStart, end - numberStart); return;
+            }
+            sb.Append('"');
+            for (int i = start; i < end; i++)
+            {
+                // Map 展示里的反斜杠是原文字，不能按 JSON 转义解码路径/正则。
+                if (s[i] == '\\' || s[i] == '"') sb.Append('\\');
+                sb.Append(s[i]);
+            }
+            sb.Append('"');
+            Fix(L.T("未加引号的字符串值（按字符串推断，原始类型可能有歧义）"));
         }
 
         void Arr()

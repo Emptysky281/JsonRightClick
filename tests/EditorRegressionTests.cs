@@ -40,6 +40,11 @@ namespace JsonRightClick
                 Run("selection detection: bounded workers, errors and MTA isolation", SelectionProbeConcurrencyTests);
                 Run("selection compatibility: IA2 ranges, object samples, hit geometry and fresh evidence", SelectionCompatibilityTests);
                 Run("selection input: full quoted/escaped JSON and nested-field preservation", SelectionInputTests);
+                Run("selection input: open ANY selected text, preserve invalid input and retry", AnySelectionViewerTests);
+                Run("button capture: read before Esc, complete original text and visible viewer", DirectButtonCaptureTests);
+                Run("parser: whole map dump, bare UID/IP/package values and type preservation", BareMapInputTests);
+                Run("parser: map scalar boundaries, strict mode, comments and roundtrips", MapScalarBoundaryTests);
+                Run("editor: map normalization, tree/folding and minify undo", MapViewerTests);
                 Run("selection capture: delayed formats, busy clipboard and version races", SelectionCaptureTests);
                 Run("bracket index: nesting, escaping, comments, invalid input", IndexTests);
                 Run("bracket index: recursive nested-string expansion", ExpansionIndexTests);
@@ -199,6 +204,270 @@ namespace JsonRightClick
                 "UI Automation queries run on an MTA worker, not the WinForms STA thread");
         }
 
+
+        static void AnySelectionViewerTests()
+        {
+            bool previous = ViewSettings.Lenient;
+            try
+            {
+                foreach (bool lenient in new[] { false, true })
+                {
+                    ViewSettings.Lenient = lenient;
+                    foreach (string input in new[] {
+                        "普通选中文字，并不是 JSON。", "ERROR synthetic log entry: connection closed", "{", "[", "{\"value\":", "{\"value\": }",
+                        "<message>ordinary text</message>", "SELECT * FROM synthetic_table", "123", "true", "\"a scalar string\"", " \t\r\n  " })
+                    {
+                        Check(SelectionProbe.ShouldShow(Sel.Yes) && SelectionProbe.NonEmptyTextRange(-1, input),
+                            "any actual text selection is eligible regardless of JSON validity, including whitespace");
+                        int ticks, reads;
+                        var captured = SimulateCopy(70, n => 71u, n => input, out ticks, out reads);
+                        Check(captured.Text == input, "capture does not reject or preformat plain/invalid selected text");
+                        using (var viewer = TrayContext.ShowViewer(captured.Text))
+                        {
+                            Application.DoEvents(); var box = Box(viewer);
+                            string expected = input.Replace("\r\n", "\n").Replace("\r", "\n");
+                            Check(viewer.Visible && box.Text == expected && !box.ReadOnly, "shared tray/button entry opens a usable editable viewer with all original text");
+                            var pieces = (List<Piece>)Field(viewer, "pieces");
+                            Check(pieces.Count == 1 && !pieces[0].IsJson && pieces[0].Text == input, "zero parsed fragments retain the entire original input, not an empty document");
+                            Check((string)Field(viewer, "statusKind") == "warn" && ((ToolStripStatusLabel)Field(viewer, "status")).Text.Contains(L.T("未识别到 JSON 对象或数组，已保留全部原文，可编辑后重试")),
+                                "unsupported input explains that all original text was retained instead of being rejected");
+                            ((ToolStripButton)Field(viewer, "btnOnly")).Checked = true;
+                            Check(box.Text == expected && !(bool)Field(viewer, "shownOnly"), "JSON-only mode cannot hide an unparseable selection");
+                            Call(viewer, "Reprocess", true, true);
+                            Check(box.Text == expected, "format/minify/expand retry never drops an unparseable selection");
+                            box.SelectAll(); Check(box.SelectedText == expected, "plain/invalid selection remains available in full for copy");
+                        }
+                    }
+                }
+                ViewSettings.Lenient = true;
+                using (var viewer = TrayContext.ShowViewer("not JSON yet"))
+                {
+                    var box = Box(viewer); box.SelectAll(); box.SelectedText = "{ \"fixed\" : 1 }"; string edited = box.Text;
+                    Call(viewer, "Reprocess", false, false);
+                    Check(JsonTools.Pretty(box.Text) != null && box.Text != edited && (string)Field(viewer, "statusKind") == "ok",
+                        "an initially unparseable selection can be edited into JSON and formatted without reopening");
+                    Call(viewer, "Undo"); Check(box.Text == edited, "formatting after a plain-text opening remains undoable");
+                }
+                string longText = "synthetic plain text " + new string('x', 160000);
+                using (var viewer = TrayContext.ShowViewer(longText))
+                { Check(Box(viewer).Text == longText && (bool)Field(viewer, "large"), "large unparseable selections also open without truncation"); }
+                using (var viewer = TrayContext.ShowViewer(null))
+                { Check(viewer.Visible && Box(viewer).Text == "" && (string)Field(viewer, "statusKind") == "muted", "explicit blank-window commands still work"); }
+                Check(!SelectionProbe.ShouldShow(Sel.No) && !SelectionProbe.ShouldShow(Sel.Unknown), "content-independent parsing never restores game-gesture false positives");
+            }
+            finally { ViewSettings.Lenient = previous; }
+        }
+
+
+        static void DirectButtonCaptureTests()
+        {
+            Check(SelectedTextReader.Accept("plain non-JSON") && SelectedTextReader.Accept(" \r\n\t") && !SelectedTextReader.Accept(null) && !SelectedTextReader.Accept(""),
+                "direct selection text is accepted by presence, never by JSON syntax or trimming");
+            using (var host = new Form { Size = new Size(620, 300), ShowInTaskbar = false })
+            using (var editor = new TextBox { Multiline = true, MaxLength = int.MaxValue, Dock = DockStyle.Fill })
+            {
+                host.Controls.Add(editor); host.Show();
+                foreach (string selected in new[] { "unrecognized ordinary text", "{\"broken\":", "[", "  \t\r\n ",
+                    "中文 😀 first\r\nsecond line", "plain " + new string('x', 70000) })
+                {
+                    host.Activate(); Native.ForceForeground(host.Handle); editor.Focus(); Application.DoEvents();
+                    editor.Text = "prefix--" + selected + "--suffix"; editor.Select(8, selected.Length);
+                    string exact = editor.SelectedText; Point point = editor.PointToScreen(new Point(15, 15));
+                    var target = SelectionTarget.Capture(host.Handle, editor.Handle, point);
+                    Check(target != null && target.IsCurrent, "direct capture test uses the actual focused source control; target=" + (target != null)
+                        + "; foreground=" + Native.ClassName(Native.GetForegroundWindow()) + "; sourceRoot=" + Native.Root(editor.Handle) + "; host=" + host.Handle);
+                    string direct = WaitForProbe(SelectedTextReader.BeforeDismissAsync(target));
+                    Check(direct == exact, "native source returns the full selected text, not a 32-character detection sample or the whole document");
+                    var order = new List<string>(); JsonViewer opened = null; int copies = 0;
+                    try
+                    {
+                        var flow = SelectedTextReader.OpenBeforeCopyAsync(
+                            () => { order.Add("read"); Check(editor.SelectionLength > 0, "selection still exists when it is read"); return System.Threading.Tasks.Task.FromResult(direct); },
+                            () => target.IsCurrent,
+                            () => { order.Add("dismiss"); editor.Select(0, 0); return System.Threading.Tasks.Task.FromResult(0); },
+                            text => { order.Add("open"); opened = TrayContext.ShowViewer(text); });
+                        bool shown = WaitForProbe(flow); if (!shown) copies++;
+                        Check(shown && copies == 0 && string.Join(",", order) == "read,dismiss,open", "actual button workflow opens directly and never needs a Ctrl+C fallback after Esc");
+                        Check(editor.SelectionLength == 0, "source fixture simulates an application that clears selection on menu dismissal");
+                        string expected = exact.Replace("\r\n", "\n").Replace("\r", "\n");
+                        Check(opened != null && opened.Visible && Box(opened).Text == expected, "ordinary/invalid content really has a visible complete viewer after source selection is gone");
+                    }
+                    finally { if (opened != null) opened.Dispose(); }
+                }
+            }
+            int dismissed = 0, shownCount = 0;
+            var stale = SelectedTextReader.OpenBeforeCopyAsync(() => System.Threading.Tasks.Task.FromResult("stale text"), () => false,
+                () => { dismissed++; return System.Threading.Tasks.Task.FromResult(0); }, text => shownCount++);
+            Check(!WaitForProbe(stale) && dismissed == 0 && shownCount == 0, "a changed target cannot dismiss another app menu or open stale text");
+            var missing = SelectedTextReader.OpenBeforeCopyAsync(() => System.Threading.Tasks.Task.FromResult<string>(null), () => true,
+                () => { dismissed++; return System.Threading.Tasks.Task.FromResult(0); }, text => shownCount++);
+            Check(!WaitForProbe(missing) && dismissed == 0 && shownCount == 0, "unavailable direct read leaves the original clipboard fallback in control");
+            var pending = new System.Threading.Tasks.TaskCompletionSource<string>();
+            string timeout = WaitForProbe(SelectedTextReader.BeforeDismissAsync(() => pending.Task, ms => System.Threading.Tasks.Task.FromResult(0)));
+            Check(timeout == null && !pending.Task.IsCompleted, "hung direct providers do not block the click or manufacture a text result");
+            Check(SelectedTextReader.CompletedText(pending.Task) == null && SelectedTextReader.CompletedText(null) == null,
+                "unfinished direct reads cannot produce success from missing data");
+            pending.SetResult("late plain text");
+            Check(SelectedTextReader.CompletedText(pending.Task) == "late plain text", "late complete source text is recoverable if the clipboard copy failed");
+            Check(SelectedTextReader.CompletedText(System.Threading.Tasks.Task.FromResult("  ")) == "  ", "late whitespace text is also not rejected by content");
+            var reader = new SelectedTextReader.Reader();
+            using (var release = new System.Threading.ManualResetEventSlim())
+            using (var started = new System.Threading.ManualResetEventSlim())
+            {
+                int calls = 0;
+                var first = reader.Read(() => { System.Threading.Interlocked.Increment(ref calls); started.Set(); release.Wait(3000); return "plain"; });
+                Check(started.Wait(1000), "one bounded direct reader starts");
+                try
+                {
+                    for (int i = 0; i < 20; i++) Check(reader.Read(() => { calls++; return "duplicate"; }).Result == null, "slow selected-text providers never accumulate parallel calls");
+                    Check(calls == 1, "only the original provider is running");
+                }
+                finally { release.Set(); }
+                Check(WaitForProbe(first) == "plain", "direct reader releases its slot when complete");
+            }
+            Check(WaitForProbe(reader.Read(() => { throw new InvalidOperationException("synthetic provider"); })) == null, "direct provider failures use the clipboard fallback instead of escaping into async UI code");
+        }
+
+
+        static string MapLikeInput()
+        {
+            // 与报告结构一致，节点/域名/标识均为合成数据，禁止把实际配置写进公开测试。
+            return "{nodes_data: {node_a: {uid: aabbcc0011223344, ip: 127.0.0.1, server: 192.0.2.20, serverName: node.example.invalid, country: CN, ports: [5678], protocal: trojan, core: 0, yl_limitrate: 4Mbps, yl_transport: auto, download_domain: [], download_ip: [], domain_glob: [], node_use_type: 1, t_port: 10006, t_port2: 10018}, "
+                + "node_b: {node_use_type: 0, core: 3, uid: 123456ab7890cdef123456ab7890cdef, ip: 198.51.100.8, ports: [2324], protocal: tj, turn: {server: [203.0.113.9]}}}, "
+                + "pkg_speed_list: [com.example.gsf, com.example.gms, com.android.vending], white_list: [], regex_speed_list: [play.example.invalid], vpn_ip_white_list: [], ca_switch: 0, "
+                + "dns: {\"proxy_server\":\"8.8.8.8\",\"custom_host_map\":{\"www.example.invalid\":\"1.1.1.1\"}}, attach: {\"diverter\":0}, "
+                + "yunluo_cfg: {\"basic\":{\"path\":\"${}\",\"mode\":\"Process\",\"processname\":[\"sample.exe\",\"browser.exe\"]},\"log\":{\"enabled\":true,\"loglevel\":\"debug\"},\"user\":{\"id\":\"synthetic\"},\"routing\":[{\"ips\":[\"192.0.2.0/24\"],\"domains\":[\"example.invalid\"],\"ports\":[],\"geoip\":0,\"outboundtags\":{\"default\":[\"direct\"]}}]}, fake_server_ip: 1.1.1.1}";
+        }
+        static JNode Child(JNode node, string key)
+        { return node.Children.Find(n => n.Key == key); }
+        static void BareMapInputTests()
+        {
+            string input = MapLikeInput();
+            foreach (bool minify in new[] { false, true })
+            {
+                var result = JsonTools.Process(input, new FormatOptions { Lenient = true, Minify = minify });
+                Check(result.Count == 1 && result.Error == null && result.Pieces.Count == 1 && result.Pieces[0].IsJson,
+                    "map-like input is converted as ONE entire object, not only the trailing three quoted fragments");
+                Check(result.Warning != null && result.Warning.Contains(L.T("未加引号的字符串值（按字符串推断，原始类型可能有歧义）")), "bare string inference is explicitly reported as lenient conversion");
+                string output = result.Pieces[0].Text;
+                Check(JsonTools.Pretty(output) != null, "map conversion produces fully strict JSON");
+                var root = Dom.Parse(output, 0); Check(root != null && root.Kind == JKind.Object && root.Count == 10, "all outer keys including the opening nodes_data survive");
+                var nodes = Child(root, "nodes_data"); Check(nodes.Kind == JKind.Object && nodes.Count == 2, "node hierarchy is retained instead of becoming log text");
+                var node = Child(nodes, "node_a");
+                foreach (var item in new[] { new[] { "uid", "aabbcc0011223344" }, new[] { "ip", "127.0.0.1" }, new[] { "server", "192.0.2.20" },
+                    new[] { "serverName", "node.example.invalid" }, new[] { "yl_limitrate", "4Mbps" }, new[] { "protocal", "trojan" }, new[] { "yl_transport", "auto" } })
+                    Check(Child(node, item[0]).Kind == JKind.String && Child(node, item[0]).StringValue == item[1], "UID/IP/domain/unit/enum values become strings without truncation");
+                Check(Child(Child(nodes, "node_b"), "uid").StringValue == "123456ab7890cdef123456ab7890cdef", "digit-leading IDs are not parsed as partial numbers");
+                Check(Child(node, "core").Kind == JKind.Number && Child(node, "core").Raw == "0", "genuine numbers retain their numeric type");
+                Check(Child(node, "ports").Children[0].Kind == JKind.Number && Child(node, "ports").Children[0].Raw == "5678", "numeric port arrays remain numbers");
+                Check(Child(root, "pkg_speed_list").Children.TrueForAll(n => n.Kind == JKind.String), "unquoted package names inside arrays become strings");
+                Check(Child(root, "white_list").Kind == JKind.Array && Child(root, "white_list").Count == 0, "empty arrays remain arrays");
+                Check(Child(Child(root, "dns"), "proxy_server").StringValue == "8.8.8.8", "already quoted nested JSON is preserved");
+                var config = Child(root, "yunluo_cfg");
+                Check(Child(Child(config, "basic"), "path").StringValue == "${}", "braces inside quoted strings do not affect structure");
+                Check(Child(Child(config, "log"), "enabled").Kind == JKind.Literal && Child(Child(config, "log"), "enabled").Raw == "true", "real JSON booleans are not quoted");
+                Check(Child(root, "fake_server_ip").StringValue == "1.1.1.1", "trailing bare IP survives with the whole root");
+                var stable = JsonTools.Process(output, new FormatOptions { Minify = minify });
+                Check(stable.Count == 1 && stable.Warning == null && stable.Error == null && stable.Pieces[0].Text == output,
+                    "format/minify is stable after a single explicit conversion");
+            }
+        }
+
+
+        static void MapScalarBoundaryTests()
+        {
+            var options = new FormatOptions { Lenient = true, Minify = true };
+            foreach (var item in new[] {
+                new[] { "trojan", "trojan" }, new[] { "CN", "CN" }, new[] { "127.0.0.1", "127.0.0.1" }, new[] { "4Mbps", "4Mbps" },
+                new[] { "com.example.service", "com.example.service" }, new[] { "1234abcdef", "1234abcdef" },
+                new[] { "true.example.invalid", "true.example.invalid" }, new[] { "false-positive", "false-positive" },
+                new[] { "null.exe", "null.exe" }, new[] { "Trueish", "Trueish" }, new[] { "00123", "00123" },
+                new[] { "1e", "1e" }, new[] { "+-1", "+-1" }, new[] { "1.2.3", "1.2.3" },
+                new[] { "NaN", "NaN" }, new[] { "Infinity", "Infinity" }, new[] { "中文😀", "中文😀" },
+                new[] { @"C:\temp\new\regex\d+", @"C:\temp\new\regex\d+" }, new[] { @"\\server\share\file", @"\\server\share\file" },
+                new[] { "https://example.invalid/a//b?q=x", "https://example.invalid/a//b?q=x" },
+                new[] { "http://example.invalid:8080/a?ref=scheme:value", "http://example.invalid:8080/a?ref=scheme:value" } })
+            {
+                var result = JsonTools.Process("{value:" + item[0] + "}", options);
+                Check(result.Count == 1 && result.Pieces.Count == 1 && JsonTools.Pretty(result.Pieces[0].Text) != null, "bare map value produces one strict object");
+                var value = Child(Dom.Parse(result.Pieces[0].Text, 0), "value");
+                Check(value.Kind == JKind.String && value.StringValue == item[1], "bare map token remains a whole string with literal backslashes and Unicode");
+                Check(result.Warning != null, "nonstandard string inference cannot be silent");
+            }
+            string source = "{name: auto, zero: 0, negative: -0, integer: 123, fraction: -1.20, exponent: 1e+99, big: 12345678901234567890123456789, plus: +2, yes: true, no: false, nothing: null, aliases: [True, False, None, undefined, NULL], quoted: [\"true\",\"123\",\"001\"]}";
+            var typed = JsonTools.Process(source, options); Check(typed.Count == 1 && typed.Pieces.Count == 1, "mixed map scalar types parse together");
+            var root = Dom.Parse(typed.Pieces[0].Text, 0);
+            foreach (var item in new[] { new[] { "zero", "0" }, new[] { "negative", "-0" }, new[] { "integer", "123" }, new[] { "fraction", "-1.20" },
+                new[] { "exponent", "1e+99" }, new[] { "big", "12345678901234567890123456789" }, new[] { "plus", "2" } })
+                Check(Child(root, item[0]).Kind == JKind.Number && Child(root, item[0]).Raw == item[1], "numeric lexemes/precision are preserved instead of double conversion");
+            Check(Child(root, "aliases").Raw == "[true,false,null,null,null]", "existing Python/JavaScript aliases keep their previous lenient semantics");
+            Check(Child(root, "quoted").Children.TrueForAll(n => n.Kind == JKind.String), "already quoted scalar strings are never type-coerced");
+            foreach (string text in new[] { "{x: auto/* note */, y: 1}", "{x: auto, // note\n y: 1}", "{x: auto, y: 1//note\n}", "{x:\u00a0auto, y: [1,],}" })
+            {
+                var result = JsonTools.Process(text, options);
+                Check(result.Count == 1 && result.Pieces.Count == 1 && Child(Dom.Parse(result.Pieces[0].Text, 0), "x").StringValue == "auto",
+                    "comments, special spaces and trailing commas remain compatible with map strings");
+            }
+            foreach (string invalid in new[] { "{a: one b: two}", "{a:1 b:2}", "{a:one:b:two}", "{a: }", "{a:,b:1}", "{a:foo[bar]}", "{a:${x}}", "{a:line\nsecond}", "{a:foo\"bar}" })
+            {
+                var result = JsonTools.Process(invalid, options);
+                Check(result.Count == 0 || result.Warning != null, "ambiguous/missing separators, empty values and broken structure are not reported as complete success");
+                Check(!(result.Count == 1 && result.Pieces.Count == 1 && result.Pieces[0].IsJson && result.Error == null),
+                    "map support does not invent an entire object from structurally invalid text");
+            }
+            Check(JsonTools.Process("[INFO]", options).Count == 0, "bare standalone log tags are not guessed into JSON arrays");
+            Check(JsonTools.Process("[INFO] 2026 [1] user=[abc] ok", options).Count == 0, "log prefixes remain ordinary text");
+            Check(JsonTools.Process("{\"x\": flase}", options).Count == 0, "quoted-key JSON typos do not opt into Map string inference");
+            Check(JsonTools.Process("{x:auto}", new FormatOptions()).Count == 0, "strict parsing never repairs unquoted map values");
+            var mixed = JsonTools.Process("prefix " + MapLikeInput() + " suffix", options);
+            Check(mixed.Count == 1 && mixed.Pieces.Count == 3 && mixed.Pieces[0].Text.StartsWith("prefix", StringComparison.Ordinal) && mixed.Pieces[2].Text.Contains("suffix"),
+                "whole maps inside mixed logs preserve surrounding text");
+            var incomplete = JsonTools.Process("{x:bad token, dns:{\"x\":1}}", options);
+            Check(incomplete.Count == 1 && incomplete.Warning != null && incomplete.Pieces.Count > 1, "partial extraction after real syntax errors retains an explicit warning");
+            bool wasEnglish = L.En;
+            try
+            {
+                L.En = true; var translated = JsonTools.Process("{x:auto}", options);
+                Check(translated.Warning != null && translated.Warning.Contains("inferred as strings"), "English UI reports inferred string types as well");
+            }
+            finally { L.En = wasEnglish; }
+            var watch = Stopwatch.StartNew();
+            var large = new StringBuilder("{items:[");
+            for (int i = 0; i < 3000; i++) { if (i > 0) large.Append(','); large.Append("{uid:id_").Append(i).Append(",ip:192.0.2.1,rate:4Mbps,active:true}"); }
+            large.Append("]}"); var batch = JsonTools.Process(large.ToString(), options);
+            Check(batch.Count == 1 && batch.Pieces.Count == 1 && JsonTools.Pretty(batch.Pieces[0].Text) != null, "large map dump is normalized as one complete document");
+            Check(watch.ElapsedMilliseconds < 5000, "map scanning does not repeatedly reparse suffixes of a valid document");
+        }
+        static void MapViewerTests()
+        {
+            bool previous = ViewSettings.Lenient;
+            try
+            {
+                ViewSettings.Lenient = true;
+                using (var viewer = Open(MapLikeInput()))
+                {
+                    var box = Box(viewer); string displayed = box.Text;
+                    Check((string)Field(viewer, "statusKind") == "warn" && ((List<Piece>)Field(viewer, "pieces")).Count == 1,
+                        "viewer shows an explicit inference warning and a single complete JSON document");
+                    var roots = (List<JNode>)Call(viewer, "GetDom");
+                    Check(roots.Count == 1 && Child(roots[0], "nodes_data").Count == 2, "tree/path model includes the previously unformatted beginning");
+                    VerifyRoot(viewer); box.FoldAll(true); Check(box.CollapsedCount > 0 && box.Text == displayed, "whole normalized map folds without dropping opening data");
+                    box.FoldAll(false); Call(viewer, "Reprocess", true, false);
+                    Check(box.Text != displayed && JsonTools.Pretty(box.Text) != null, "normalized map minifies as standard JSON");
+                    Call(viewer, "Undo"); Check(box.Text == displayed, "minify undo restores the complete normalized map");
+                    ((ToolStripButton)Field(viewer, "btnOnly")).Checked = true;
+                    Check(JsonTools.BuildView(JsonTools.Process(box.Text, true).Pieces, false).Text
+                        == JsonTools.BuildView(JsonTools.Process(displayed, true).Pieces, false).Text,
+                        "JSON-only view does not discard an unparsed map prefix, regardless of the last formatting mode");
+                    Call(viewer, "LoadText", MapLikeInput(), false, true);
+                    Check((string)Field(viewer, "statusKind") == "warn" && ((ToolStripStatusLabel)Field(viewer, "status")).Text.Contains(L.T("未加引号的字符串值（按字符串推断，原始类型可能有歧义）")),
+                        "expand-nested operation cannot hide the conversion/type-inference warning");
+                    Check(JsonTools.Pretty(box.Text) != null && Child(Dom.Parse(box.Text, 0), "nodes_data").Count == 2,
+                        "expanding nested input still displays the complete converted map");
+                }
+            }
+            finally { ViewSettings.Lenient = previous; }
+        }
 
         static string QuoteJson(string text)
         {
