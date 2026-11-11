@@ -364,6 +364,26 @@ namespace JsonRightClick
             items.Add(sizeMenu);
 
             items.Add(new ToolStripSeparator());
+            items.Add(new ToolStripMenuItem(L.T("霓虹光标（轻量）", "Neon caret (lightweight)"), null, delegate
+            {
+                ViewSettings.NeonCaret = !ViewSettings.NeonCaret;
+                foreach (Form form in Application.OpenForms)
+                {
+                    var viewer = form as JsonViewer;
+                    if (viewer != null) viewer.box.SetNeonCaret(ViewSettings.NeonCaret, Theme.Current.Dark, Theme.Current.Back);
+                }
+            }) { Checked = ViewSettings.NeonCaret,
+                ToolTipText = L.T("渐变紫色亮芯与窄柔光，沿用系统闪烁；可单独关闭移动拖尾", "Purple-gradient core and narrow glow with native blinking; movement trail can be disabled separately") });
+            items.Add(new ToolStripMenuItem(L.T("光标灵动拖尾（短暂）", "Caret movement trail (brief)"), null, delegate
+            {
+                ViewSettings.CaretTrail = !ViewSettings.CaretTrail;
+                foreach (Form form in Application.OpenForms)
+                {
+                    var viewer = form as JsonViewer;
+                    if (viewer != null) viewer.box.SetNeonCaret(ViewSettings.NeonCaret, Theme.Current.Dark, Theme.Current.Back);
+                }
+            }) { Checked = ViewSettings.CaretTrail, Enabled = ViewSettings.NeonCaret,
+                ToolTipText = L.T("仅移动时短暂绘制有长度上限的渐变紫色拖尾；空闲、滚动和输入法组词时停止", "Short, length-capped purple-gradient trail only on caret movement; stops while idle, scrolling or composing with IME") });
             items.Add(new ToolStripMenuItem(L.T("宽松解析（无引号键/值、单引号、末尾逗号等）"), null, delegate
             {
                 ViewSettings.Lenient = !ViewSettings.Lenient;
@@ -526,6 +546,7 @@ namespace JsonRightClick
             split.BackColor = th.Border;
             editorSurface.BackColor = split.Panel1.BackColor = split.Panel2.BackColor = th.Back;
             box.BackColor = th.Back;
+            box.SetNeonCaret(ViewSettings.NeonCaret, th.Dark, th.Back);
             box.HighlightColor = th.Highlight;
             if (box.ContextMenuStrip != null) ApplyRenderer(box.ContextMenuStrip);
             ApplyRenderer(btnSettings.DropDown);

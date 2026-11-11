@@ -16,7 +16,7 @@ namespace JsonRightClick
         // RichEdit 会在恢复焦点/回答输入法位置查询时把旧光标滚进屏幕。
         // 这些消息不是导航意图：必须在第一次鼠标命中测试之前保持当前横纵视口，
         // 不能通过重选旧光标、延迟回滚或把编辑焦点抢回来解决。
-        protected override void WndProc(ref Message message)
+        void ProcessFocusMessage(ref Message message)
         {
             bool positionQuery = (message.Msg == ImeQueryPosition && message.WParam == (IntPtr)1)
                 || (message.Msg == 0x0288 /* WM_IME_REQUEST */ && message.WParam == (IntPtr)6 /* IMR_QUERYCHARPOSITION */);

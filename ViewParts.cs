@@ -67,6 +67,8 @@ namespace JsonRightClick
         public static bool Dark { get { return GetB("DarkMode", false); } set { SetB("DarkMode", value); } }
         public static bool Lenient { get { return GetB("Lenient", true); } set { SetB("Lenient", value); } }
         public static bool ShowTree { get { return GetB("ShowTree", false); } set { SetB("ShowTree", value); } }
+        public static bool NeonCaret { get { return GetB("NeonCaret", true); } set { SetB("NeonCaret", value); } }
+        public static bool CaretTrail { get { return GetB("CaretTrail", true); } set { SetB("CaretTrail", value); } }
         public static string MaskKeys { get { return Get("MaskKeys", Mask.DefaultKeys); } set { Set("MaskKeys", value); } }
 
         public static string FontName
@@ -450,6 +452,7 @@ namespace JsonRightClick
             Point position = ScrollPos;
             int first = (int)Native.SendMessage(Handle, 0x00CE /* EM_GETFIRSTVISIBLELINE */, IntPtr.Zero, IntPtr.Zero);
             if (viewportKnown && position == lastScroll && first == lastFirstLine) return;
+            CaretTrailViewportChanged(lastScroll, position);
             viewportKnown = true; lastScroll = position; lastFirstLine = first;
             if (Highlights.Count > 0 || bracketOpen >= 0 || (folding != null && folding.CollapsedCount > 0)) Invalidate();
             var handler = ViewportChanged;
@@ -459,7 +462,7 @@ namespace JsonRightClick
         protected override void OnVScroll(EventArgs e) { base.OnVScroll(e); OnViewportChanged(); }
         protected override void OnHScroll(EventArgs e) { base.OnHScroll(e); OnViewportChanged(); }
         protected override void OnResize(EventArgs e) { StopSmooth(); viewportKnown = false; base.OnResize(e); }
-        protected override void OnHandleDestroyed(EventArgs e) { StopSmooth(); base.OnHandleDestroyed(e); }
+        protected override void OnHandleDestroyed(EventArgs e) { StopSmooth(); ReleaseNeonCaret(); base.OnHandleDestroyed(e); }
         protected override void OnLostFocus(EventArgs e) { StopSmooth(); base.OnLostFocus(e); }
 
         public Point ScrollPos
@@ -496,12 +499,12 @@ namespace JsonRightClick
                         break;
                     }
                 case 0x000F: // WM_PAINT
-                    if (Highlights.Count > 0 || bracketOpen >= 0 || folding.CollapsedCount > 0)
+                    if (Highlights.Count > 0 || bracketOpen >= 0 || folding.CollapsedCount > 0 || HasCaretTrailPaint)
                     {
                         IntPtr rgn = Native.CreateRectRgn(0, 0, 0, 0);
                         Native.GetUpdateRgn(Handle, rgn, false);
                         base.WndProc(ref m);
-                        try { using (var clip = Region.FromHrgn(rgn)) { PaintHighlights(clip); folding.Paint(clip); PaintBrackets(clip); } }
+                        try { using (var clip = Region.FromHrgn(rgn)) { PaintHighlights(clip); folding.Paint(clip); PaintBrackets(clip); PaintCaretTrail(clip); } }
                         catch { }
                         finally { Native.DeleteObject(rgn); }
                         return;
@@ -628,7 +631,7 @@ namespace JsonRightClick
         protected override void Dispose(bool disposing)
         {
             StopSmooth();
-            if (disposing) { anim.Dispose(); if (folding != null) folding.Dispose(); }
+            if (disposing) { ReleaseNeonCaret(); anim.Dispose(); if (folding != null) folding.Dispose(); }
             base.Dispose(disposing);
         }
     }

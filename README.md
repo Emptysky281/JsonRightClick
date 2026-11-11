@@ -22,6 +22,7 @@
 - **括号配对**：将输入光标放在 `{` / `}` / `[` / `]` 的任意一侧（括号前或后），即可同时高亮对应的一对括号；鼠标点击与方向键移动均可触发，无需选中文字，并在左侧折叠栏及文本缩进处显示该层级的竖向范围线；括号在屏幕外时范围线会裁剪到可见区域。另一端超出可视区域时，编辑区顶部或底部显示对应行预览，点击预览即可跳转。展开嵌套、压缩、撤销、只看 JSON、打码及大文件模式下均可使用；字符串内的括号不会误匹配。
 - **代码折叠**：编辑区左侧点击 `− / +` 手动折叠或展开对象 / 数组；收起后点击 `{…}` / `[…]` 可展开。工具栏「折叠」及右键「代码折叠」支持当前层级、全部折叠 / 展开；子层级的独立折叠状态会保留。折叠只改变显示，复制、格式化和撤销使用的仍是完整原文，搜索或树形定位会自动展开目标。
 - **悬停提示**：嵌套 JSON 字符串、JWT、时间戳的提示跟随鼠标，在同一段长文本内移动也会更新位置；靠近屏幕边缘自动调整，滚动、编辑或离开编辑区后隐藏。
+- **轻量渐变紫色输入光标**：加粗的紫色渐变亮芯与窄柔光，深浅主题分别调整对比度，仍由 Windows 原生 caret 负责实际位置和闪烁。移动时出现短暂的紫色渐变缓动拖尾，真实输入位置不滞后；只绘制最多 8 段、最长 96 像素的局部彩带，不使用粒子、全屏模糊或全文重绘。动画间隔 25 ms，每次移动后的收尾不超过 160 ms，空闲时定时器完全停止；滚动、失焦、选区、输入法组词、字号变化和远距离跳转会取消拖尾。设置中的「霓虹光标（轻量）」和「光标灵动拖尾（短暂）」可分别开关并记忆，也可只保留无动画的渐变紫色光标。遵循 Windows 关闭界面动画的设置，高对比度和输入法组词时保留系统光标；不改变文本、选区、撤销或滚动位置。
 - **界面**：深色 / 浅色主题、导入字体（保存在程序目录 `Fonts\`）、字号记忆、中英文切换、开机自启。
 - 单个 exe，只依赖 Windows 自带的 .NET Framework 4.x，**不联网**。
 
@@ -91,6 +92,16 @@ build.bat
 | `JsonRightClick.exe` | 主程序：托盘、悬浮按钮、查看窗口 |
 | `JsonRightClickMenu.exe` | Win11 第一层右键菜单的 COM 服务（带稀疏包身份，manifest 见 `appmenu.manifest`） |
 
+### 不打扰桌面的光标测试
+
+```powershell
+./tests/run-caret-headless-tests.ps1
+# 可选：在 .test-output/purple-caret-preview 中生成离屏示意帧
+./tests/run-caret-headless-tests.ps1 -Preview
+```
+
+此入口只测试纯几何模型和 Bitmap 绘制，不创建编辑窗口、不抢焦点、不模拟输入、不使用剪贴板或写入用户设置。检查渐变颜色、XOR 编码、长度与寿命上限、密集移动重定向、绘图裁剪、原生 caret 区域避让和 GDI 资源释放；离屏耗时不等同于真实桌面帧率。`run-tests.ps1` 和滚动基准会打开交互窗口，需在电脑空闲或 CI 环境运行。
+
 ## 卸载
 
 1. 托盘菜单 →「资源管理器右键菜单」→ 关闭（会同时移除稀疏包和经典菜单注册表项）。
@@ -147,6 +158,7 @@ JsonRightClick.exe --uitest samples\sample.log out.txt
 - IDEA-style code folding with a left gutter, clickable placeholders, current/all-level menu actions and keyboard shortcuts; the complete source text and editing undo history are retained.
 - Hover hints follow the pointer, including within very long wrapped strings, and stay within the screen.
 - Dark / light theme, custom fonts, remembered font size, Chinese / English UI, start with Windows.
+- Lightweight purple-gradient insertion caret: cached lavender-to-violet core and narrow glow, native Windows position/blinking, plus a brief movement-only ribbon (8 segments, at most 96 px, 25 ms timer interval, at most 160 ms to settle). The real insertion point never lags. No particles, full-screen blur or document scan; the timer stops while idle. Scrolling, selection, focus loss, IME composition and layout changes cancel the trail. Settings remember separate caret/trail toggles; disabling just the trail retains a static purple-gradient caret. Windows reduced-animation preferences are respected; high-contrast mode and IME composition keep the system caret.
 - Single exe on the built-in .NET Framework 4.x. No network access.
 
 Build with `build.bat` (no Visual Studio needed). Keep both exes in the same writable folder and run `JsonRightClick.exe`. To uninstall, turn off the context menu and autostart from the tray menu, exit, and delete the folder.

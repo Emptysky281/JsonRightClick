@@ -74,6 +74,10 @@ namespace JsonRightClick
                 Run("pixel scrolling: hidden Unicode text, selections and mutation safety", HiddenTextCompatibilityTests);
                 Run("native frame clock: restart, cancellation, disposal and deferred work", FrameLifecycleTests);
                 Run("inactive scrolling: focus/IME queries preserve the browsed viewport", InactiveScrollActivationTests);
+                Run("neon caret: XOR colors, contrast and bounded glow geometry", NeonCaretVisualTests);
+                Run("neon caret: native focus, input/undo, selection, theme, zoom and toggle", NeonCaretNativeTests);
+                Run("neon caret: cached bitmap and GDI ownership lifecycle", NeonCaretResourceTests);
+                Run("purple trail: real key movement, idle stop, interruption and disposal", RainbowCaretNativeTests);
                 Console.WriteLine("ALL PASSED: " + checks + " assertions");
                 return 0;
             }
@@ -1363,6 +1367,218 @@ namespace JsonRightClick
                 var box = Box(viewer); box.Focus();
                 Check(box.ScrollPos == Point.Empty && box.SelectionStart == 0, "empty-editor focus still initializes normally");
             }
+        }
+
+
+        static Native.GUITHREADINFO CaretState(CodeBox box)
+        {
+            var info = new Native.GUITHREADINFO { cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO)) };
+            Check(Native.GetGUIThreadInfo(Native.GetCurrentThreadId(), ref info) && info.hwndCaret == box.Handle,
+                "the editor still owns the native accessibility/IME caret");
+            return info;
+        }
+        static int CaretDistance(Color a, Color b)
+        { return Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B); }
+        static Color DecodeCaretPixel(Color back, Color mask)
+        { return Color.FromArgb(back.R ^ mask.R, back.G ^ mask.G, back.B ^ mask.B); }
+        static void NeonCaretVisualTests()
+        {
+            foreach (bool dark in new[] { false, true })
+                foreach (int height in new[] { 10, 19, 28, 44, 96 })
+                    foreach (int nativeWidth in new[] { 1, 3, 6 })
+                    {
+                        Color back = dark ? Theme.Night.Back : Theme.Light.Back;
+                        using (var image = NeonCaretVisual.Build(height, nativeWidth, back, dark))
+                        {
+                            int core = NeonCaretVisual.CoreWidth(height, nativeWidth), halo = NeonCaretVisual.HaloWidth(core);
+                            Check(core >= 2 && core >= nativeWidth && image.Width == core + halo && image.Height == height,
+                                "neon caret has a thick readable core, respects accessibility width and scales with line height");
+                            Check(halo <= 8 && image.Width <= Math.Max(nativeWidth, (height + 7) / 10) + 8,
+                                "glow remains a narrow strip rather than a large expensive overlay");
+                            Color center = DecodeCaretPixel(back, image.GetPixel(0, height / 2));
+                            Check(center.ToArgb() == NeonCaretVisual.ColorAt((double)(height / 2) / (height - 1), dark).ToArgb(), "native XOR restores the intended visible core color in both themes");
+                            Check(CaretDistance(back, center) > 250, "the core stays high-contrast against both light and dark backgrounds");
+                            int previous = CaretDistance(back, center);
+                            for (int x = core; x < image.Width; x++)
+                            {
+                                int next = CaretDistance(back, DecodeCaretPixel(back, image.GetPixel(x, height / 2)));
+                                Check(next < previous, "cached glow smoothly fades to the right of the exact insertion position"); previous = next;
+                            }
+                            Check(CaretDistance(back, DecodeCaretPixel(back, image.GetPixel(0, 0))) < CaretDistance(back, center),
+                                "top and bottom caps are softened without moving the native caret origin");
+                        }
+                    }
+        }
+        static void NeonCaretNativeTests()
+        {
+            bool oldDark = ViewSettings.Dark, oldNeon = ViewSettings.NeonCaret;
+            float oldSize = ViewSettings.FontSize;
+            try
+            {
+                ViewSettings.NeonCaret = true; ViewSettings.FontSize = 12;
+                foreach (bool dark in new[] { true, false })
+                {
+                    ViewSettings.Dark = dark;
+                    using (var viewer = Open("{\"unicode\":\"中文 😀\",\"items\":[1,2,3]}"))
+                    {
+                        var box = Box(viewer); Native.ForceForeground(viewer.Handle); box.Focus(); box.Select(4, 0); Application.DoEvents();
+                        string text = box.Text, rtf = box.Rtf; bool undo = box.CanUndo;
+                        int version = (int)Field(viewer, "textVersion"); Point scroll = box.ScrollPos;
+                        var info = CaretState(box);
+                        if (SystemInformation.HighContrast)
+                        {
+                            Check((IntPtr)Field(box, "neonBitmap") == IntPtr.Zero, "Windows high-contrast mode retains its original system caret");
+                            continue;
+                        }
+                        Check((IntPtr)Field(box, "neonBitmap") != IntPtr.Zero && info.r - info.l == (int)Field(box, "neonWidth"),
+                            "the real Windows caret uses the neon bitmap, not merely a painted screenshot");
+                        Check(info.r - info.l > (int)Field(box, "originalCaretWidth") && info.b - info.t > 8,
+                            "native caret gets a visibly thicker core plus glow at actual editor line height");
+                        Point start = new Point(info.l, info.t);
+                        box.SetNeonCaret(false, dark, Theme.Current.Back);
+                        info = CaretState(box);
+                        Check(new Point(info.l, info.t) == start && info.r - info.l == (int)Field(box, "originalCaretWidth"),
+                            "disabling neon immediately restores a normal caret at exactly the same text position");
+                        box.SetNeonCaret(true, dark, Theme.Current.Back);
+                        int builds = (int)Field(box, "neonBitmapBuilds"), invalidations = 0;
+                        IntPtr bitmap = (IntPtr)Field(box, "neonBitmap");
+                        InvalidateEventHandler invalidated = delegate { invalidations++; };
+                        box.Invalidated += invalidated;
+                        var watch = Stopwatch.StartNew();
+                        for (int i = 0; i < 600; i++) box.RefreshNeonCaret();
+                        box.Invalidated -= invalidated;
+                        Check(invalidations == 0 && (int)Field(box, "neonBitmapBuilds") == builds && (IntPtr)Field(box, "neonBitmap") == bitmap,
+                            "idle/native refresh reuses one cached bitmap without issuing any editor repaint");
+                        Check(watch.ElapsedMilliseconds < 1200, "constant-time caret refresh has no document scan or animation work");
+                        Console.WriteLine("  neon native refresh: 600 calls in " + watch.ElapsedMilliseconds + " ms, bitmap builds=" + builds);
+                        for (int i = 0; i < 20; i++) { box.Select(4 + i % 6, 0); box.Invalidate(); box.Update(); }
+                        Check((int)Field(box, "neonBitmapBuilds") == builds, "caret movement and normal painting do not allocate a bitmap per frame");
+                        box.Select(4, 0);
+                        Check(box.Text == text && box.Rtf == rtf && box.CanUndo == undo && (int)Field(viewer, "textVersion") == version && box.ScrollPos == scroll,
+                            "neon never changes source, formatting, selection semantics, undo or scroll position");
+                        box.Select(4, 5); box.RefreshNeonCaret();
+                        Check(box.SelectionStart == 4 && box.SelectionLength == 5 && (int)Field(box, "neonBitmapBuilds") == builds,
+                            "a selected text range is left to RichEdit without moving or reallocating it");
+                        box.Select(4, 0);
+                        Native.SendMessage(box.Handle, 0x010D, IntPtr.Zero, IntPtr.Zero);
+                        Check((bool)Field(box, "imeComposing"), "IME composing flag remains active while glow is suppressed");
+                        info = CaretState(box);
+                        Check(info.r - info.l <= (int)Field(box, "originalCaretWidth"), "composition uses the normal input-method caret");
+                        Native.SendMessage(box.Handle, 0x010E, IntPtr.Zero, IntPtr.Zero);
+                        Check(!(bool)Field(box, "imeComposing") && CaretState(box).r - CaretState(box).l == (int)Field(box, "neonWidth"),
+                            "ending IME composition restores the cached glow");
+                        Native.SendMessage(box.Handle, 0x0102, (IntPtr)'x', IntPtr.Zero); Check(box.CanUndo && box.Text != text, "neon input still reaches the native editor");
+                        box.Undo(); Check(box.Text == text, "native undo remains intact with a bitmap caret");
+                        ViewSettings.FontSize = 18; Call(viewer, "Restyle"); box.RefreshNeonCaret();
+                        Check((int)Field(box, "neonHeight") > info.b - info.t, "zoom rebuilds one bitmap to match the new line height");
+                        ViewSettings.FontSize = 12; Call(viewer, "Restyle");
+                        ViewSettings.Dark = !dark; Call(viewer, "Restyle");
+                        Check((bool)Field(box, "neonDark") == !dark && (Color)Field(box, "neonBackground") == Theme.Current.Back,
+                            "theme changes use a new XOR mask for the actual editor background");
+                        ViewSettings.Dark = dark; Call(viewer, "Restyle");
+                        using (var search = new TextBox { Dock = DockStyle.Top, Text = "another input control" })
+                        {
+                            // 窄窗口中的工具栏搜索框可能在溢出菜单里，使用一个明确可见的输入框验证焦点归属。
+                            viewer.Controls.Add(search); search.BringToFront(); search.Focus(); Application.DoEvents();
+                            var otherCaret = new Native.GUITHREADINFO { cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO)) };
+                            Native.GetGUIThreadInfo(Native.GetCurrentThreadId(), ref otherCaret); IntPtr owner = otherCaret.hwndCaret;
+                            box.RefreshNeonCaret(); Native.GetGUIThreadInfo(Native.GetCurrentThreadId(), ref otherCaret);
+                            Check(search.Focused && !box.Focused && otherCaret.hwndCaret == owner, "a nonfocused editor never steals another input field caret");
+                            viewer.Controls.Remove(search);
+                        }
+                        box.Focus(); box.Select(4, 0); box.RefreshNeonCaret();
+                        Call(viewer, "BuildSettingsMenu");
+                        var settings = (ToolStripDropDownButton)Field(viewer, "btnSettings"); ToolStripMenuItem option = null;
+                        foreach (ToolStripItem item in settings.DropDownItems)
+                            if (item.Text == L.T("霓虹光标（轻量）", "Neon caret (lightweight)")) option = (ToolStripMenuItem)item;
+                        Check(option != null && option.Checked, "settings expose a remembered simple neon caret toggle");
+                        option.PerformClick(); box.Focus(); box.RefreshNeonCaret();
+                        Check(!ViewSettings.NeonCaret && CaretState(box).r - CaretState(box).l == (int)Field(box, "originalCaretWidth"),
+                            "the settings toggle restores the system caret without reformatting the document");
+                        option.PerformClick(); box.Focus(); box.RefreshNeonCaret();
+                        Check(ViewSettings.NeonCaret && box.Text == text, "toggle back on retains all content");
+                    }
+                }
+                using (var viewer = Open(""))
+                {
+                    var box = Box(viewer); Native.ForceForeground(viewer.Handle); box.Focus(); box.RefreshNeonCaret();
+                    Check(box.Text == "" && box.SelectionStart == 0 && (SystemInformation.HighContrast || (IntPtr)Field(box, "neonBitmap") != IntPtr.Zero),
+                        "empty input windows also get a visible insertion caret");
+                }
+            }
+            finally { ViewSettings.Dark = oldDark; ViewSettings.NeonCaret = oldNeon; ViewSettings.FontSize = oldSize; }
+        }
+        static void NeonCaretResourceTests()
+        {
+            bool dark = ViewSettings.Dark, enabled = ViewSettings.NeonCaret;
+            try
+            {
+                ViewSettings.NeonCaret = true;
+                var viewer = Open("{\"text\":\"resource test\"}"); var box = Box(viewer);
+                try
+                {
+                    Native.ForceForeground(viewer.Handle); box.Focus(); box.Select(5, 0); box.RefreshNeonCaret();
+                    uint before = Native.GetGuiResources(Process.GetCurrentProcess().Handle, 0);
+                    for (int i = 0; i < 80; i++)
+                    { bool night = i % 2 == 0; box.SetNeonCaret(true, night, night ? Theme.Night.Back : Theme.Light.Back); }
+                    uint after = Native.GetGuiResources(Process.GetCurrentProcess().Handle, 0);
+                    Check(after <= before + 2, "80 theme changes keep at most one native caret bitmap instead of leaking GDI handles");
+                    var other = new TextBox { Dock = DockStyle.Top }; viewer.Controls.Add(other); other.BringToFront(); other.Text = "search-like control"; other.Focus();
+                    var info = new Native.GUITHREADINFO { cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO)) }; Native.GetGUIThreadInfo(Native.GetCurrentThreadId(), ref info);
+                    IntPtr owner = info.hwndCaret; box.Dispose(); Native.GetGUIThreadInfo(Native.GetCurrentThreadId(), ref info);
+                    Check((IntPtr)Field(box, "neonBitmap") == IntPtr.Zero && info.hwndCaret == owner,
+                        "disposing an inactive editor frees its bitmap without destroying another control caret");
+                    other.Dispose();
+                }
+                finally { viewer.Dispose(); }
+            }
+            finally { ViewSettings.Dark = dark; ViewSettings.NeonCaret = enabled; }
+        }
+
+
+        // This is an interactive/CI test only. The headless entry never executes it.
+        static void RainbowCaretNativeTests()
+        {
+            bool oldNeon = ViewSettings.NeonCaret, oldTrail = ViewSettings.CaretTrail;
+            try
+            {
+                ViewSettings.NeonCaret = ViewSettings.CaretTrail = true;
+                using (var viewer = Open("{\"text\":\"steady purple ribbon movement example\"}"))
+                {
+                    var box = Box(viewer); Native.ForceForeground(viewer.Handle); box.Focus();
+                    box.Select(box.Text.IndexOf("steady", StringComparison.Ordinal) + 2, 0); box.Update(); Application.DoEvents();
+                    var model = (RainbowCaretTrail)Field(box, "caretTrail");
+                    string text = box.Text; Point scroll = box.ScrollPos; bool undo = box.CanUndo;
+                    int start = box.SelectionStart;
+                    Native.SendMessage(box.Handle, 0x0100, (IntPtr)Keys.Right, IntPtr.Zero);
+                    Check(box.SelectionStart == start + 1, "arrow input still moves the real native insertion point immediately");
+                    if (!(bool)Field(box, "neonAnimations") || SystemInformation.HighContrast)
+                    { Check(!model.Active, "Windows reduced-animation/high-contrast preferences suppress the trail"); return; }
+                    Check(model.Active, "real native keyboard movement, not only a synthetic bitmap, starts the ribbon");
+                    var timer = (System.Windows.Forms.Timer)Field(box, "caretTrailTimer");
+                    Check(timer != null && timer.Enabled, "movement arms the bounded-duration timer");
+                    var deadline = Stopwatch.StartNew();
+                    while (timer.Enabled && deadline.ElapsedMilliseconds < 2000) { System.Threading.Thread.Sleep(5); Application.DoEvents(); }
+                    Check(!model.Active && !timer.Enabled, "idle stops the timer completely rather than polling indefinitely");
+                    Native.SendMessage(box.Handle, 0x0100, (IntPtr)Keys.Right, IntPtr.Zero);
+                    Check(model.Active && timer.Enabled, "typing/navigation after idle retains the last real caret baseline");
+                    box.Select(box.SelectionStart, 3);
+                    Check(!model.Active && !timer.Enabled && box.SelectionLength == 3, "EM_EXSETSEL selection cancels without changing its range");
+                    box.Select(start, 0);
+                    Native.SendMessage(box.Handle, 0x0100, (IntPtr)Keys.Right, IntPtr.Zero);
+                    Native.SendMessage(box.Handle, 0x010D, IntPtr.Zero, IntPtr.Zero);
+                    Check(!model.Active && !timer.Enabled, "IME composition cancels motion before candidate positioning");
+                    Native.SendMessage(box.Handle, 0x010E, IntPtr.Zero, IntPtr.Zero);
+                    Native.SendMessage(box.Handle, 0x0100, (IntPtr)Keys.Right, IntPtr.Zero);
+                    ViewSettings.CaretTrail = false; box.SetNeonCaret(true, Theme.Current.Dark, Theme.Current.Back);
+                    Check(!model.Active && !timer.Enabled && (IntPtr)Field(box, "neonBitmap") != IntPtr.Zero,
+                        "disabling only the trail retains the cached static purple-gradient caret");
+                    Check(box.Text == text && box.CanUndo == undo && box.ScrollPos == scroll, "visual motion leaves text, undo and viewport unchanged");
+                    box.Dispose();
+                    Check(Field(box, "caretTrailTimer") == null, "disposing the editor releases its animation timer");
+                }
+            }
+            finally { ViewSettings.NeonCaret = oldNeon; ViewSettings.CaretTrail = oldTrail; }
         }
 
 
