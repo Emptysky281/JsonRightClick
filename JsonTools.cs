@@ -33,6 +33,8 @@ namespace JsonRightClick
     public sealed class FormatOptions
     {
         public bool Minify;   // 压缩为一行
+        public bool CompactArrays; // 只把数组及其内容收紧为一行，数组外的对象仍保留多行缩进
+        public bool SmartArrays; // 短普通数组单行；对象数组每项一行，复杂对象按需展开
         public bool Expand;   // 把值为 JSON 的字符串展开
         public bool Lenient;  // 严格解析失败时尝试宽松规则；Map 表示中的无引号字符串会明确提示类型推断。
     }
@@ -51,15 +53,15 @@ namespace JsonRightClick
     {
         const int MaxDepth = 512;
         readonly string s;
-        readonly bool minify, expand, lenient, mapValues;
+        readonly bool minify, compactArrays, expand, lenient, mapValues;
         readonly StringBuilder sb = new StringBuilder();
         readonly HashSet<string> fixes;
-        int p, depth, expanded;
+        int p, depth, expanded, arrayDepth;
         bool unquotedKeys;
 
         JsonFormatter(string s, int start, FormatOptions o, bool lenient, bool mapValues, int depth, HashSet<string> fixes)
         {
-            this.s = s; p = start; minify = o.Minify; expand = o.Expand; this.lenient = lenient; this.mapValues = mapValues; this.depth = depth; this.fixes = fixes;
+            this.s = s; p = start; minify = o.Minify; compactArrays = o.CompactArrays; expand = o.Expand; this.lenient = lenient; this.mapValues = mapValues; this.depth = depth; this.fixes = fixes;
         }
 
         public sealed class Result
@@ -73,6 +75,13 @@ namespace JsonRightClick
         /// <summary>从 start 开始解析一个 JSON 值。先严格解析，失败且允许时再用宽松规则重试。</summary>
         public static Result Run(string s, int start, FormatOptions o, int depth)
         {
+            if (o.SmartArrays && !o.Minify && !o.CompactArrays)
+            {
+                // 先完整解析/修复/展开为严格的紧凑 JSON，再只做布局；不为每个对象反复解析。
+                var smart = Run(s, start, new FormatOptions { Minify = true, Expand = o.Expand, Lenient = o.Lenient }, depth);
+                if (smart.Ok) smart.Text = SmartArrayLayout.Format(smart.Text, depth);
+                return smart;
+            }
             var r = Attempt(s, start, o, false, false, depth);
             if (r.Ok || !o.Lenient) return r;
             var r2 = Attempt(s, start, o, true, false, depth);
@@ -128,9 +137,11 @@ namespace JsonRightClick
             }
         }
 
+        bool InlineLayout { get { return minify || (compactArrays && arrayDepth > 0); } }
+
         void NewLine()
         {
-            if (minify) return;
+            if (InlineLayout) return;
             sb.Append("\r\n").Append(' ', depth * 2);
         }
 
@@ -177,7 +188,7 @@ namespace JsonRightClick
                 else Fail(L.T("应为属性名（双引号字符串）"));
                 Ws();
                 if (p >= s.Length || s[p] != ':') Fail(L.T("应为 ':'"));
-                p++; sb.Append(minify ? ":" : ": ");
+                p++; sb.Append(InlineLayout ? ":" : ": ");
                 Value(); Ws();
                 if (p >= s.Length) Fail(L.T("对象缺少 '}'"));
                 if (s[p] == ',')
@@ -279,24 +290,29 @@ namespace JsonRightClick
         void Arr()
         {
             if (++depth > MaxDepth) Fail(L.T("嵌套过深"));
-            p++; Ws();
-            if (p < s.Length && s[p] == ']') { p++; depth--; sb.Append("[]"); return; }
-            sb.Append('[');
-            while (true)
+            arrayDepth++;
+            try
             {
-                NewLine();
-                Value(); Ws();
-                if (p >= s.Length) Fail(L.T("数组缺少 ']'"));
-                if (s[p] == ',')
+                p++; Ws();
+                if (p < s.Length && s[p] == ']') { p++; depth--; sb.Append("[]"); return; }
+                sb.Append('[');
+                while (true)
                 {
-                    p++;
-                    if (lenient) { Ws(); if (p < s.Length && s[p] == ']') { p++; depth--; NewLine(); sb.Append(']'); Fix(L.T("末尾多余的逗号")); return; } }
-                    sb.Append(',');
-                    continue;
+                    NewLine();
+                    Value(); Ws();
+                    if (p >= s.Length) Fail(L.T("数组缺少 ']'"));
+                    if (s[p] == ',')
+                    {
+                        p++;
+                        if (lenient) { Ws(); if (p < s.Length && s[p] == ']') { p++; depth--; NewLine(); sb.Append(']'); Fix(L.T("末尾多余的逗号")); return; } }
+                        sb.Append(',');
+                        continue;
+                    }
+                    if (s[p] == ']') { p++; depth--; NewLine(); sb.Append(']'); return; }
+                    Fail(L.T("应为 ',' 或 ']'"));
                 }
-                if (s[p] == ']') { p++; depth--; NewLine(); sb.Append(']'); return; }
-                Fail(L.T("应为 ',' 或 ']'"));
             }
+            finally { arrayDepth--; } // 退出 [] 后，后续对象属性恢复普通多行缩进。
         }
 
         void Str(bool isKey)
@@ -357,7 +373,7 @@ namespace JsonRightClick
             if (quoted.Length < 4) return false;
             string inner = JsonTools.Unescape(quoted, 1, quoted.Length - 2).Trim();
             if (inner.Length < 2 || (inner[0] != '{' && inner[0] != '[')) return false;
-            var r = Run(inner, 0, new FormatOptions { Minify = minify, Expand = true, Lenient = lenient }, depth);
+            var r = Run(inner, 0, new FormatOptions { Minify = InlineLayout, CompactArrays = compactArrays, Expand = true, Lenient = lenient }, depth);
             if (!r.Ok || inner.Substring(r.End).Trim().Length > 0 || r.Text == "{}" || r.Text == "[]") return false;
             sb.Append(r.Text);
             expanded += 1 + r.Expanded;

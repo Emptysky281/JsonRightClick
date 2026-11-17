@@ -22,6 +22,16 @@ namespace JsonRightClick
             d["重新格式化 (Ctrl+Enter)"] = "Reformat (Ctrl+Enter)";
             d["压缩"] = "Minify";
             d["压缩为一行"] = "Minify to one line";
+            d["智能收紧"] = "Smart compact";
+            d["智能收紧（推荐）"] = "Smart compact (recommended)";
+            d["数组全部单行"] = "All arrays on one line";
+            d["全部展开"] = "Expand all";
+            d["恢复普通多行缩进（同「格式化」）"] = "Restore ordinary multiline indentation (same as Format)";
+            d["短数组保持单行，对象数组每项一行；复杂或过长对象自动展开，Ctrl+Z 撤销"] = "Short arrays inline, object arrays one item per line; complex or long objects expand automatically, Ctrl+Z undoes";
+            d["已智能收紧 {0} 段 JSON（对象数组按元素分行）"] = "Smart-compacted {0} JSON segment(s) (object arrays split by item)";
+            d["数组单行"] = "Inline arrays";
+            d["将所有 [] 内的内容收紧为一行，外层对象保持多行；点「格式化」恢复，Ctrl+Z 撤销"] = "Put all array contents on one line, keeping outer objects multiline; Format expands them again, Ctrl+Z undoes";
+            d["已将 {0} 段 JSON 的数组内容收紧为单行"] = "Inlined array contents in {0} JSON segment(s)";
             d["展开嵌套"] = "Expand nested";
             d["把内容是 JSON 的字符串（如 \"data\":\"{\\\"a\\\":1}\"）展开成对象，可 Ctrl+Z 撤销"] = "Expand strings whose content is JSON (e.g. \"data\":\"{\\\"a\\\":1}\") into objects; Ctrl+Z to undo";
             d["复制全部"] = "Copy all";

@@ -20,6 +20,12 @@ jobs:
           Get-Content selftest.txt -TotalCount 1
           if ($p.ExitCode -ne 0) { exit 1 }
           if (-not (Select-String selftest.txt -Pattern 'REFORMAT STABLE == True' -Quiet)) { exit 1 }
+      - name: Hidden toolbar-layout tests
+        shell: pwsh
+        run: ./tests/run-toolbar-headless-tests.ps1
+      - name: Headless array-formatting tests
+        shell: pwsh
+        run: ./tests/run-array-headless-tests.ps1
       - name: Headless caret tests
         shell: pwsh
         run: ./tests/run-caret-headless-tests.ps1

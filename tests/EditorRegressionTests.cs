@@ -44,14 +44,19 @@ namespace JsonRightClick
                 Run("button capture: read before Esc, complete original text and visible viewer", DirectButtonCaptureTests);
                 Run("parser: whole map dump, bare UID/IP/package values and type preservation", BareMapInputTests);
                 Run("parser: map scalar boundaries, strict mode, comments and roundtrips", MapScalarBoundaryTests);
+                Run("parser: inline arrays, surrounding objects, literal strings and roundtrips", delegate { checks += CompactArrayHeadlessTests.RunAll(); });
                 Run("editor: map normalization, tree/folding and minify undo", MapViewerTests);
                 Run("selection capture: delayed formats, busy clipboard and version races", SelectionCaptureTests);
                 Run("bracket index: nesting, escaping, comments, invalid input", IndexTests);
                 Run("bracket index: recursive nested-string expansion", ExpansionIndexTests);
                 Run("bracket index: large document and deep nesting", LargeIndexTests);
                 Run("tooltip layout: screen edges and negative monitor coordinates", PlacementTests);
+                Run("toolbar: hidden layout, rows, scaling, docking and state", delegate { checks += ToolbarHeadlessTests.RunAll(); });
                 Run("editor: click/caret, selection, edits, undo, themes, search", EditorTests);
+                Run("toolbar: viewer resize retains input, actions and document state", ToolbarWrappingTests);
                 Run("editor: expand nested, minify, undo, JSON-only, mask", TransformationTests);
+                Run("editor: inline-array toolbar, undo, folding, JSON-only and masking", CompactArrayToolbarTests);
+                Run("editor: smart-array split button, modes, view state and undo", SmartArrayToolbarTests);
                 Run("editor: off-screen matching line previews and jump", PreviewTests);
                 Run("editor: long-token hover follows mouse and invalidates", HoverTests);
                 Run("editor: large-file visible coloring preserves bracket match", LargeEditorTests);
@@ -743,6 +748,39 @@ namespace JsonRightClick
                 ViewSettings.Dark = false; ViewSettings.FontSize = 10.5f;
             }
         }
+        // Interactive suite only; never executed by the dedicated hidden-layout test entry.
+        static void ToolbarWrappingTests()
+        {
+            using (var viewer = Open("{\"value\":[1,2],\"other\":true}"))
+            {
+                var box = Box(viewer); string text = box.Text;
+                var strip = (WrappingToolStrip)Field(viewer, "tools");
+                var search = (ToolStripTextBox)Field(viewer, "search");
+                var settings = (ToolStripDropDownButton)Field(viewer, "btnSettings");
+                var smart = (ToolStripSplitButton)Field(viewer, "btnArrayLayout");
+                IntPtr handle = search.Control.Handle;
+                search.Text = "value"; search.TextBox.Focus(); search.TextBox.Select(1, 2);
+                viewer.Width = 1600; Application.DoEvents(); int wideHeight = strip.Height;
+                foreach (int width in new[] { 600, 420, 280, 1600 })
+                {
+                    viewer.Width = width; Application.DoEvents();
+                    Check(box.Text == text && search.Text == "value" && search.Control.Handle == handle,
+                        "reflow preserves source data, search text and the existing native input handle");
+                    Check(search.TextBox.SelectionStart == 1 && search.TextBox.SelectionLength == 2,
+                        "resize does not reset the search insertion point or selection");
+                    foreach (ToolStripItem item in strip.Items)
+                        if (item.Available)
+                            Check(item.Placement == ToolStripItemPlacement.Main && item.Bounds.Right <= strip.Width && item.Bounds.Bottom <= strip.Height,
+                                "all viewer actions remain on visible toolbar rows instead of an overflow menu");
+                    Check(box.Top >= 0 && ((SplitContainer)Field(viewer, "split")).Top >= strip.Bottom,
+                        "additional rows push the editor down instead of covering its first line");
+                    Check(settings.Owner == strip && smart.DropDownItems.Count == 3, "settings and array-layout choices retain their original owner and handlers");
+                    if (width == 420) Check(strip.Height > wideHeight, "narrowing the actual viewer adds toolbar rows");
+                }
+                Check(strip.Height == wideHeight, "widening restores the original toolbar height");
+            }
+        }
+
         static void TransformationTests()
         {
             using (var v = Open(NestedInput()))
@@ -768,6 +806,114 @@ namespace JsonRightClick
                 Check(b.BracketOpen == open && b.BracketClose == close, "restoring full log uses new offsets");
             }
         }
+        // Interactive suite only; never executed by run-array-headless-tests.ps1.
+        static void CompactArrayToolbarTests()
+        {
+            const string input = "{\"ip\":[\"aaa\",\"bbb\"],\"objects\":[{\"ports\":[80,443]}],\"outside\":{\"keep\":true},\"password\":\"synthetic-only\"}";
+            using (var viewer = Open(input))
+            {
+                var box = Box(viewer); string before = box.Text;
+                var button = (ToolStripMenuItem)Field(viewer, "miCompactArrays");
+                Check(button != null && button.OwnerItem == Field(viewer, "btnArrayLayout") && button.Text == L.T("数组全部单行"), "the legacy single-line action remains in the array layout dropdown");
+                button.PerformClick();
+                string compact = box.Text;
+                string expected = JsonTools.Process(input, new FormatOptions { CompactArrays = true }).Pieces[0].Text.Replace("\r\n", "\n");
+                Check(compact == expected && compact != before && !compact.Contains("{…}") && !compact.Contains("[…]"), "toolbar genuinely removes array line breaks, rather than hiding elements behind fold placeholders");
+                Check((bool)Field(viewer, "lastCompactArrays") && !(bool)Field(viewer, "lastMinify"), "array-only layout remains distinct from full Minify");
+                VerifyRoot(viewer);
+                int array = box.Text.IndexOf('['); box.Select(array, 0);
+                Check(box.BracketOpen == array && box.BracketClose > array, "array-only formatting refreshes bracket positions");
+                box.FoldCurrent(true); box.FoldCurrent(false);
+                Check(box.Text == compact, "ordinary folding still preserves the full compact-array source");
+                Call(viewer, "Undo");
+                Check(box.Text == before && !(bool)Field(viewer, "lastCompactArrays"), "one undo restores both multiline text and its previous layout mode");
+                button.PerformClick();
+                var history = (System.Collections.ICollection)Field(viewer, "history"); int historyCount = history.Count;
+                button.PerformClick();
+                Check(box.Text == compact && history.Count == historyCount, "repeated clicks are idempotent and do not add duplicate formatting snapshots");
+                Call(viewer, "Reprocess", false, false);
+                Check(box.Text == before && !(bool)Field(viewer, "lastCompactArrays"), "normal Format restores multiline arrays");
+                Call(viewer, "Undo");
+                Check(box.Text == compact && (bool)Field(viewer, "lastCompactArrays"), "undoing normal Format restores the compact-array mode as well as text");
+                Call(viewer, "Reprocess", true, false);
+                Check(!box.Text.Contains("\n") && !(bool)Field(viewer, "lastCompactArrays") && (bool)Field(viewer, "lastMinify"), "full Minify still produces one line for the whole document");
+                Call(viewer, "Undo");
+                Check(box.Text == compact && (bool)Field(viewer, "lastCompactArrays") && !(bool)Field(viewer, "lastMinify"), "undoing Minify restores compact-array mode without flattening surrounding objects");
+            }
+            using (var viewer = Open("prefix " + input + " between {\"ports\":[1,2]} suffix"))
+            {
+                var box = Box(viewer); var button = (ToolStripMenuItem)Field(viewer, "miCompactArrays");
+                button.PerformClick(); string compactFull = box.Text;
+                var only = (ToolStripButton)Field(viewer, "btnOnly"); only.Checked = true;
+                Check(!box.Text.Contains("prefix") && box.Text.Contains("[\"aaa\",\"bbb\"]") && (bool)Field(viewer, "lastCompactArrays"), "JSON-only view retains array-only layout");
+                only.Checked = false;
+                Check(box.Text == compactFull && box.Text.Contains("prefix") && box.Text.Contains("suffix"), "restoring full view keeps the original logs and compact-array layout");
+                Call(viewer, "Reprocess", false, false); string pretty = box.Text;
+                var mask = (ToolStripButton)Field(viewer, "btnMask"); mask.Checked = true;
+                Check(box.ReadOnly && !box.Text.Contains("synthetic-only"), "mask mode remains read-only before formatting");
+                button.PerformClick();
+                Check(box.ReadOnly && !box.Text.Contains("synthetic-only") && box.Text.Contains("[\"aaa\",\"bbb\"]"), "array formatting cannot leak masked values or unlock editing");
+                mask.Checked = false;
+                Check(box.Text == compactFull && box.Text.Contains("synthetic-only"), "unmasking restores real values in the new array layout");
+                Call(viewer, "Undo");
+                Check(box.Text == pretty, "formatting while masked can still be undone after unmasking");
+            }
+            using (var viewer = Open("plain text\n[INFO]"))
+            {
+                var box = Box(viewer); string original = box.Text;
+                ((ToolStripMenuItem)Field(viewer, "miCompactArrays")).PerformClick();
+                Check(box.Text == original, "invalid selections stay visible and unchanged after the new toolbar action");
+            }
+        }
+
+        static void SmartArrayToolbarTests()
+        {
+            const string input = "{\"router\":[{\"name\":\"global\",\"chains\":[\"line1\"],\"fallback\":\"direct\"},{\"name\":\"game.exe\",\"chains\":[\"line1\"],\"fallback\":\"direct\"}],\"password\":\"synthetic-only\"}";
+            using (var viewer = Open(input))
+            {
+                var box = Box(viewer); string pretty = box.Text;
+                var button = (ToolStripSplitButton)Field(viewer, "btnArrayLayout");
+                Check(button.Owner == Field(viewer, "tools") && button.Text == L.T("智能收紧") && button.DropDownItems.Count == 3,
+                    "toolbar exposes a smart default action plus all three array layout choices");
+                button.PerformButtonClick();
+                string smart = box.Text;
+                string expected = JsonTools.Process(input, new FormatOptions { SmartArrays = true }).Pieces[0].Text.Replace("\r\n", "\n");
+                Check(smart == expected && smart != pretty && (bool)Field(viewer, "lastSmartArrays") && !(bool)Field(viewer, "lastCompactArrays"),
+                    "the main button applies smart layout rather than the old all-on-one-line behavior");
+                VerifyRoot(viewer);
+                Call(viewer, "Undo");
+                Check(box.Text == pretty && !(bool)Field(viewer, "lastSmartArrays"), "undo restores the text and previous layout mode");
+                ((ToolStripMenuItem)Field(viewer, "miSmartArrays")).PerformClick();
+                Check(box.Text == smart && (bool)Field(viewer, "lastSmartArrays"), "smart dropdown item matches the main action");
+                var history = (System.Collections.ICollection)Field(viewer, "history"); int count = history.Count;
+                button.PerformButtonClick();
+                Check(box.Text == smart && history.Count == count, "repeated smart clicks are stable without duplicate snapshots");
+                ((ToolStripMenuItem)Field(viewer, "miCompactArrays")).PerformClick();
+                Check(box.Text.Contains("[{\"name\":\"global\"") && !(bool)Field(viewer, "lastSmartArrays") && (bool)Field(viewer, "lastCompactArrays"),
+                    "explicit all-array-single-line mode remains available in the dropdown");
+                Call(viewer, "Undo");
+                Check(box.Text == smart && (bool)Field(viewer, "lastSmartArrays"), "undo restores smart mode after a compact-mode switch");
+                ((ToolStripMenuItem)Field(viewer, "miExpandArrays")).PerformClick();
+                Check(box.Text == pretty && !(bool)Field(viewer, "lastSmartArrays") && !(bool)Field(viewer, "lastCompactArrays"), "expanded mode restores ordinary multiline JSON");
+                Call(viewer, "Undo");
+                Check(box.Text == smart && (bool)Field(viewer, "lastSmartArrays"), "undo after expanding restores smart rows");
+            }
+            using (var viewer = Open("prefix " + input + " suffix"))
+            {
+                var box = Box(viewer); var button = (ToolStripSplitButton)Field(viewer, "btnArrayLayout");
+                button.PerformButtonClick(); string smart = box.Text;
+                var only = (ToolStripButton)Field(viewer, "btnOnly"); only.Checked = true;
+                Check((bool)Field(viewer, "lastSmartArrays") && !box.Text.Contains("prefix") && box.Text.Contains("{\"name\": \"global\""), "JSON-only view keeps smart array layout");
+                only.Checked = false;
+                Check(box.Text == smart && (bool)Field(viewer, "lastSmartArrays"), "restoring logs keeps smart rows and the selected mode");
+                var mask = (ToolStripButton)Field(viewer, "btnMask"); mask.Checked = true;
+                button.PerformButtonClick();
+                Check(box.ReadOnly && !box.Text.Contains("synthetic-only") && (bool)Field(viewer, "lastSmartArrays"), "smart formatting cannot unmask sensitive values or unlock the editor");
+                mask.Checked = false;
+                Check(box.Text == smart, "unmasking restores real data in smart layout");
+            }
+        }
+
         static void PreviewTests()
         {
             var input = new StringBuilder("{\"items\":[");

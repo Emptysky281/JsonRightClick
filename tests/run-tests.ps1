@@ -16,7 +16,7 @@ $sources = @(Get-ChildItem -LiteralPath $root -Filter '*.cs' -File | ForEach-Obj
 $exe = Join-Path $output 'EditorRegressionTests.exe'
 & (Join-Path $framework 'csc.exe') /nologo /target:exe /platform:anycpu /optimize+ /unsafe /codepage:65001 `
     /main:JsonRightClick.EditorRegressionTests ('/out:' + $exe) ('/win32manifest:' + (Join-Path $root 'app.manifest')) `
-    @references @sources (Join-Path $PSScriptRoot 'EditorRegressionTests.cs')
+    @references @sources (Join-Path $PSScriptRoot 'EditorRegressionTests.cs') (Join-Path $PSScriptRoot 'CompactArrayHeadlessTests.cs') (Join-Path $PSScriptRoot 'ToolbarHeadlessTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Regression test compilation failed.' }
 & $exe
 if ($LASTEXITCODE -ne 0) { throw 'Editor regression tests failed.' }

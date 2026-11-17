@@ -20,9 +20,11 @@
 - **混合文本**：从日志里提取多段 JSON，非 JSON 内容原样保留；「只看 JSON」模式下的修改会合并回全文。
 - **查看工具**：树形视图、JSON 路径、全部匹配高亮搜索（支持正则 / 大小写）、敏感字段打码、JWT 解码、时间戳提示、展开嵌套 JSON 字符串、宽松解析（单引号、尾逗号、注释、Python 字面量）、压缩 / 格式化。
 - **括号配对**：将输入光标放在 `{` / `}` / `[` / `]` 的任意一侧（括号前或后），即可同时高亮对应的一对括号；鼠标点击与方向键移动均可触发，无需选中文字，并在左侧折叠栏及文本缩进处显示该层级的竖向范围线；括号在屏幕外时范围线会裁剪到可见区域。另一端超出可视区域时，编辑区顶部或底部显示对应行预览，点击预览即可跳转。展开嵌套、压缩、撤销、只看 JSON、打码及大文件模式下均可使用；字符串内的括号不会误匹配。
+- **智能收紧**：上方工具栏的主按钮默认执行智能数组排版：短普通数组如 `["aaa","bbb"]` 保持单行；对象数组每个元素单独一行，简单对象在该行内显示完整字段，方便上下对比。包含复杂嵌套、超过 6 个字段或超过约 120 字符行预算的对象自动展开；过长普通数组也逐项分行。右侧下拉保留「智能收紧（推荐）」「数组全部单行」「全部展开」三种方式；「数组全部单行」仍会把 `[]` 内的对象 / 数组一起收紧。都是实际排版，不省略数据，不改变字符串、转义、数字精度、属性顺序或类型；支持混合日志、宽松解析、只看 JSON 和打码。`Ctrl+Z` 可撤销并恢复上一种布局，点「格式化」或「全部展开」可回到普通多行格式；不可拆分的长字符串仍遵循独立的「换行」开关进行屏幕软换行。
 - **代码折叠**：编辑区左侧点击 `− / +` 手动折叠或展开对象 / 数组；收起后点击 `{…}` / `[…]` 可展开。工具栏「折叠」及右键「代码折叠」支持当前层级、全部折叠 / 展开；子层级的独立折叠状态会保留。折叠只改变显示，复制、格式化和撤销使用的仍是完整原文，搜索或树形定位会自动展开目标。
 - **悬停提示**：嵌套 JSON 字符串、JWT、时间戳的提示跟随鼠标，在同一段长文本内移动也会更新位置；靠近屏幕边缘自动调整，滚动、编辑或离开编辑区后隐藏。
 - **轻量渐变紫色输入光标**：加粗的紫色渐变亮芯与窄柔光，深浅主题分别调整对比度，仍由 Windows 原生 caret 负责实际位置和闪烁。移动时出现短暂的紫色渐变缓动拖尾，真实输入位置不滞后；只绘制最多 8 段、最长 96 像素的局部彩带，不使用粒子、全屏模糊或全文重绘。动画间隔 25 ms，每次移动后的收尾不超过 160 ms，空闲时定时器完全停止；滚动、失焦、选区、输入法组词、字号变化和远距离跳转会取消拖尾。设置中的「霓虹光标（轻量）」和「光标灵动拖尾（短暂）」可分别开关并记忆，也可只保留无动画的渐变紫色光标。遵循 Windows 关闭界面动画的设置，高对比度和输入法组词时保留系统光标；不改变文本、选区、撤销或滚动位置。
+- **工具栏自动换行**：窗口变窄时，上方放不下的操作自动排到第二行或更多行，编辑区随之下移，不会被遮挡，也不必去溢出菜单里找按钮；窗口拉宽后自动合回。宽度足够时搜索 / 设置区仍靠右，尽量保持在同一行；更窄时搜索框也会缩短并参与换行，拉宽后恢复原宽度。调整布局不会重建搜索输入框、清空搜索文字或改变按钮状态。
 - **界面**：深色 / 浅色主题、导入字体（保存在程序目录 `Fonts\`）、字号记忆、中英文切换、开机自启。
 - 单个 exe，只依赖 Windows 自带的 .NET Framework 4.x，**不联网**。
 
@@ -64,6 +66,17 @@
 
 在折叠块边界按 Backspace / Delete 会先展开，避免误删隐藏内容；再次按键才进行普通删除。
 
+### 智能收紧示例
+
+```json
+{
+  "router": [
+    {"name": "global", "chains": ["line1"], "fallback": "direct"},
+    {"name": "game.exe", "chains": ["line1"], "fallback": "direct"}
+  ]
+}
+```
+
 ## 系统要求
 
 - Windows 10 / 11（Win11 第一层右键菜单需要打开「开发人员模式」）
@@ -91,6 +104,22 @@ build.bat
 | --- | --- |
 | `JsonRightClick.exe` | 主程序：托盘、悬浮按钮、查看窗口 |
 | `JsonRightClickMenu.exe` | Win11 第一层右键菜单的 COM 服务（带稀疏包身份，manifest 见 `appmenu.manifest`） |
+
+### 不打扰桌面的工具栏布局测试
+
+```powershell
+./tests/run-toolbar-headless-tests.ps1
+```
+
+仅在内存中对不可见的 WinForms 控件做布局计算，测试会验证没有创建原生窗口句柄；不会显示窗口、抢焦点、发送键鼠或访问剪贴板。覆盖中英文、不同字体大小、单行与多行切换、编辑区停靠、搜索框宽度恢复、动态匹配计数以及反复调整尺寸的稳定性。
+
+### 不打扰桌面的数组排版测试
+
+```powershell
+./tests/run-array-headless-tests.ps1
+```
+
+只运行纯解析 / 格式化测试，不创建窗口、不模拟输入或访问剪贴板。覆盖全部单行 / 智能排版两种模式、对象数组逐项分行、复杂对象和长行展开、嵌套数组、字符串转义、外层缩进恢复、重复属性与数值精度、宽松解析、嵌套展开、混合日志、JSON-only 合并、无效输入保留、随机往返与大数组。完整工具栏点击、撤销、打码和折叠的交互回归仍在 `run-tests.ps1` 中，需在电脑空闲或 CI 环境运行。
 
 ### 不打扰桌面的光标测试
 
@@ -155,8 +184,10 @@ JsonRightClick.exe --uitest samples\sample.log out.txt
 - Matching-bracket highlights, with a clickable line preview when the other bracket is off screen; works after expanding nested JSON strings.
 - Scope guides connect matching brackets in the left gutter and indentation area, clipped to the visible viewport.
 - Cached native layout and tokenization, budgeted non-selection coloring, and viewport-bounded search highlights reduce scrolling stalls and text flicker.
+- **Smart compact** split-button: short scalar arrays stay inline; object arrays split into one item per line, keeping simple objects on their own compact row. Complex objects, objects over 6 fields or the approximate 120-character line budget, and overly long scalar arrays expand automatically. The dropdown also retains **All arrays on one line** and **Expand all**. No values are hidden or converted: strings/escapes, number precision, duplicate keys and property order stay intact. Ctrl+Z restores the previous text and layout; JSON-only view and masking retain the selected layout. Long indivisible strings still obey the separate Word wrap setting.
 - IDEA-style code folding with a left gutter, clickable placeholders, current/all-level menu actions and keyboard shortcuts; the complete source text and editing undo history are retained.
 - Hover hints follow the pointer, including within very long wrapped strings, and stay within the screen.
+- The top toolbar automatically wraps into additional rows when narrow and returns to fewer rows when widened; actions are not hidden in an overflow popup. The editor docks below all rows. Search/settings stay right-aligned when possible, and the search box shrinks if needed without being recreated or losing text/state.
 - Dark / light theme, custom fonts, remembered font size, Chinese / English UI, start with Windows.
 - Lightweight purple-gradient insertion caret: cached lavender-to-violet core and narrow glow, native Windows position/blinking, plus a brief movement-only ribbon (8 segments, at most 96 px, 25 ms timer interval, at most 160 ms to settle). The real insertion point never lags. No particles, full-screen blur or document scan; the timer stops while idle. Scrolling, selection, focus loss, IME composition and layout changes cancel the trail. Settings remember separate caret/trail toggles; disabling just the trail retains a static purple-gradient caret. Windows reduced-animation preferences are respected; high-contrast mode and IME composition keep the system caret.
 - Single exe on the built-in .NET Framework 4.x. No network access.

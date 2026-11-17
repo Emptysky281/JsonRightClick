@@ -24,13 +24,15 @@ namespace JsonRightClick
         readonly JsonTree tree = new JsonTree();
         readonly SplitContainer split = new SplitContainer();
         readonly EditorSurface editorSurface = new EditorSurface { Dock = DockStyle.Fill };
-        readonly ToolStrip tools;
+        readonly WrappingToolStrip tools;
         readonly StatusStrip bar;
         readonly ToolStripStatusLabel status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
         readonly ToolStripStatusLabel pathLabel = new ToolStripStatusLabel("") { IsLink = false, ToolTipText = L.T("当前位置的 JSON 路径（点击复制）") };
         string fileInfo = "";
         readonly ToolStripStatusLabel hint = new ToolStripStatusLabel("");
         readonly ToolStripButton btnWrap, btnOnly, btnTop, btnTheme, btnPrev, btnNext, btnMask, btnTree, btnRegex, btnCase;
+        readonly ToolStripSplitButton btnArrayLayout;
+        readonly ToolStripMenuItem miSmartArrays, miCompactArrays, miExpandArrays;
         readonly ToolStripTextBox search;
         readonly ToolStripLabel searchCount = new ToolStripLabel("");
         readonly ToolStripDropDownButton btnSettings, btnFolding;
@@ -53,7 +55,7 @@ namespace JsonRightClick
 
         List<Piece> pieces = new List<Piece>(); // 当前完整内容（JSON 段 + 非 JSON 文字）
         bool shownOnly;   // 当前框里显示的是不是“只看 JSON”视图
-        bool rendering, edited, lastMinify, masked;
+        bool rendering, edited, lastMinify, lastCompactArrays, lastSmartArrays, masked;
         string realText;  // 打码时保存的真实内容（框内格式）
         string titleBase = L.T("JSON 解析");
         string statusKind = "muted";
@@ -73,7 +75,7 @@ namespace JsonRightClick
         int bracketVersion = -1;
 
         // 格式化等操作的撤销记录
-        sealed class Snapshot { public string Display; public List<Piece> Pieces; public bool ShownOnly; public string After; }
+        sealed class Snapshot { public string Display; public List<Piece> Pieces; public bool ShownOnly, Minify, CompactArrays, SmartArrays; public string After; }
         readonly List<Snapshot> history = new List<Snapshot>();
 
         // 悬停提示
@@ -102,9 +104,32 @@ namespace JsonRightClick
             float scale;
             using (var g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f; // 不能用 CreateGraphics：会提前创建窗口句柄
 
-            tools = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(6, 3, 6, 3), Stretch = true };
+            tools = new WrappingToolStrip();
             tools.Items.Add(new ToolStripButton(L.T("格式化"), null, delegate { Reprocess(false, false); }) { ToolTipText = L.T("重新格式化 (Ctrl+Enter)") });
             tools.Items.Add(new ToolStripButton(L.T("压缩"), null, delegate { Reprocess(true, false); }) { ToolTipText = L.T("压缩为一行") });
+            btnArrayLayout = new ToolStripSplitButton(L.T("智能收紧"))
+            { Name = "arrayLayout", ToolTipText = L.T("短数组保持单行，对象数组每项一行；复杂或过长对象自动展开，Ctrl+Z 撤销") };
+            btnArrayLayout.ButtonClick += delegate { ReprocessLayout(false, false, false, true); };
+            miSmartArrays = new ToolStripMenuItem(L.T("智能收紧（推荐）"), null, delegate { ReprocessLayout(false, false, false, true); });
+            miCompactArrays = new ToolStripMenuItem(L.T("数组全部单行"), null, delegate { ReprocessLayout(false, false, true, false); });
+            miExpandArrays = new ToolStripMenuItem(L.T("全部展开"), null, delegate { Reprocess(false, false); });
+            miSmartArrays.Name = "smartArrays";
+            miSmartArrays.ToolTipText = btnArrayLayout.ToolTipText;
+            miCompactArrays.Name = "compactArrays";
+            miCompactArrays.ToolTipText = L.T("将所有 [] 内的内容收紧为一行，外层对象保持多行；点「格式化」恢复，Ctrl+Z 撤销");
+            miExpandArrays.Name = "expandedArrays";
+            miExpandArrays.ToolTipText = L.T("恢复普通多行缩进（同「格式化」）");
+            btnArrayLayout.DropDownItems.Add(miSmartArrays);
+            btnArrayLayout.DropDownItems.Add(miCompactArrays);
+            btnArrayLayout.DropDownItems.Add(miExpandArrays);
+            btnArrayLayout.DropDownOpening += delegate
+            {
+                miSmartArrays.Checked = lastSmartArrays;
+                miCompactArrays.Checked = lastCompactArrays;
+                miExpandArrays.Checked = !lastMinify && !lastSmartArrays && !lastCompactArrays;
+                ApplyRenderer(btnArrayLayout.DropDown);
+            };
+            tools.Items.Add(btnArrayLayout);
             tools.Items.Add(new ToolStripButton(L.T("展开嵌套"), null, delegate { Reprocess(false, true); }) { ToolTipText = L.T("把内容是 JSON 的字符串（如 \"data\":\"{\\\"a\\\":1}\"）展开成对象，可 Ctrl+Z 撤销") });
             btnFolding = new ToolStripDropDownButton(L.T("折叠", "Fold"));
             AddFoldingMenu(btnFolding.DropDownItems);
@@ -116,7 +141,7 @@ namespace JsonRightClick
             btnOnly.CheckedChanged += delegate
             {
                 if (rendering) return;
-                if (!Reprocess(lastMinify, false)) { rendering = true; btnOnly.Checked = !btnOnly.Checked; rendering = false; }
+                if (!ReprocessLayout(lastMinify, false, lastCompactArrays, lastSmartArrays)) { rendering = true; btnOnly.Checked = !btnOnly.Checked; rendering = false; }
             };
             btnMask = new ToolStripButton(L.T("打码")) { CheckOnClick = true, ToolTipText = L.T("把 password、token、手机号等敏感字段显示成 ******，方便截图分享（只读，复制的也是打码后的内容）") };
             btnMask.CheckedChanged += delegate { if (!rendering && !SetMasked(btnMask.Checked)) { rendering = true; btnMask.Checked = masked; rendering = false; } };
@@ -133,7 +158,7 @@ namespace JsonRightClick
             tools.Items.Add(btnWrap);
             tools.Items.Add(btnTop);
 
-            // 右侧（从右往左添加）：设置、主题、搜索
+            // 搜索/设置区按视觉顺序添加：宽时靠右，窄时跟随工具栏自然换到下一行。
             btnSettings = new ToolStripDropDownButton(L.T("⚙ 设置")) { Alignment = ToolStripItemAlignment.Right, ShowDropDownArrow = false, ToolTipText = L.T("字体、字号、宽松解析、打码字段等设置") };
             btnSettings.DropDownOpening += delegate { L.Refresh(); BuildSettingsMenu(); };
             BuildSettingsMenu();
@@ -156,15 +181,16 @@ namespace JsonRightClick
                 if (e.KeyCode == Keys.Enter) { Find(!e.Shift); e.Handled = e.SuppressKeyPress = true; }
                 else if (e.KeyCode == Keys.Escape) { box.Focus(); e.Handled = e.SuppressKeyPress = true; }
             };
-            tools.Items.Add(btnSettings);
-            tools.Items.Add(btnTheme);
-            tools.Items.Add(new ToolStripSeparator { Alignment = ToolStripItemAlignment.Right });
-            tools.Items.Add(btnNext);
-            tools.Items.Add(btnPrev);
-            tools.Items.Add(searchCount);
-            tools.Items.Add(btnCase);
-            tools.Items.Add(btnRegex);
             tools.Items.Add(search);
+            tools.Items.Add(btnRegex);
+            tools.Items.Add(btnCase);
+            tools.Items.Add(searchCount);
+            tools.Items.Add(btnPrev);
+            tools.Items.Add(btnNext);
+            tools.Items.Add(new ToolStripSeparator());
+            tools.Items.Add(btnTheme);
+            tools.Items.Add(btnSettings);
+            tools.ConfigureSearchGroup(search);
 
             box.Dock = DockStyle.Fill;
             box.BorderStyle = BorderStyle.None;
@@ -786,7 +812,9 @@ namespace JsonRightClick
         }
 
         /// <summary>基于完整内容重新解析并按当前视图显示（可用 Ctrl+Z 撤销）</summary>
-        bool Reprocess(bool minify, bool expand)
+        bool Reprocess(bool minify, bool expand) { return ReprocessLayout(minify, expand, false, false); }
+
+        bool ReprocessLayout(bool minify, bool expand, bool compactArrays, bool smartArrays)
         {
             string full = FullText();
             if (full == null)
@@ -798,8 +826,8 @@ namespace JsonRightClick
                 if (ans != DialogResult.Yes) return false;
                 full = JsonTools.StripHeaders(Crlf(RealText()));
             }
-            var snap = new Snapshot { Display = RealText(), Pieces = pieces, ShownOnly = shownOnly };
-            LoadText(full, minify, expand);
+            var snap = new Snapshot { Display = RealText(), Pieces = pieces, ShownOnly = shownOnly, Minify = lastMinify, CompactArrays = lastCompactArrays, SmartArrays = lastSmartArrays };
+            LoadLayout(full, minify, expand, compactArrays, smartArrays);
             if (RealText() != snap.Display)
             {
                 snap.After = RealText();
@@ -810,11 +838,14 @@ namespace JsonRightClick
             return true;
         }
 
-        void LoadText(string text, bool minify, bool expand)
+        void LoadText(string text, bool minify, bool expand) { LoadLayout(text, minify, expand, false, false); }
+
+        void LoadLayout(string text, bool minify, bool expand, bool compactArrays, bool smartArrays)
         {
             text = text ?? "";
-            lastMinify = minify;
-            var r = JsonTools.Process(text, new FormatOptions { Minify = minify, Expand = expand, Lenient = ViewSettings.Lenient });
+            lastMinify = minify; lastCompactArrays = compactArrays && !minify;
+            lastSmartArrays = smartArrays && !minify && !lastCompactArrays;
+            var r = JsonTools.Process(text, new FormatOptions { Minify = minify, CompactArrays = lastCompactArrays, SmartArrays = lastSmartArrays, Expand = expand, Lenient = ViewSettings.Lenient });
             // 解析失败只影响格式化结果，不影响打开窗口；零片段时始终使用完整输入。
             pieces = r.Count > 0 ? r.Pieces : new List<Piece> { new Piece { Text = text } };
             shownOnly = btnOnly.Checked && r.Count > 0;
@@ -831,6 +862,16 @@ namespace JsonRightClick
                 if (expand)
                 {
                     msg = r.Expanded > 0 ? L.F("已展开 {0} 个嵌套 JSON 字符串", r.Expanded) : L.T("没有找到内容是 JSON 的字符串");
+                    if (r.Warning != null) msg += L.T("；", "; ") + r.Warning;
+                }
+                else if (lastSmartArrays)
+                {
+                    msg = L.F("已智能收紧 {0} 段 JSON（对象数组按元素分行）", r.Count);
+                    if (r.Warning != null) msg += L.T("；", "; ") + r.Warning;
+                }
+                else if (lastCompactArrays)
+                {
+                    msg = L.F("已将 {0} 段 JSON 的数组内容收紧为单行", r.Count);
                     if (r.Warning != null) msg += L.T("；", "; ") + r.Warning;
                 }
                 SetStatus(msg + "", r.Warning != null ? "warn" : "ok");
@@ -883,7 +924,7 @@ namespace JsonRightClick
             }
             history.RemoveAt(history.Count - 1);
             pieces = s.Pieces;
-            shownOnly = s.ShownOnly;
+            shownOnly = s.ShownOnly; lastMinify = s.Minify; lastCompactArrays = s.CompactArrays; lastSmartArrays = s.SmartArrays;
             rendering = true; btnOnly.Checked = s.ShownOnly; rendering = false;
             ReplaceDisplay(s.Display);
             SetStatus(L.T("已撤销上一次格式化操作"), "ok");
