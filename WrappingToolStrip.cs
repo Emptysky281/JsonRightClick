@@ -77,7 +77,22 @@ namespace JsonRightClick
         {
             if (layingOut) return;
             layingOut = true;
-            try { PrepareRows(); base.OnLayout(e); }
+            try
+            {
+                PrepareRows(); base.OnLayout(e);
+                if (AutoSize && LayoutStyle == ToolStripLayoutStyle.Flow && (Dock == DockStyle.Top || Dock == DockStyle.Bottom))
+                {
+                    // 停靠容器可能先用“旧宽度/旧弹性间距”缓存的首选高度分配空间。
+                    // 原生子控件已创建时尤其明显：按钮已换好行，条带却还留着多余空行。
+                    // 以这一轮实际排好的行底部为准同步收敛，避免延迟计时或强制重建输入框。
+                    int bottom = Padding.Top;
+                    foreach (ToolStripItem item in Items)
+                        if (item.Available && item.Placement == ToolStripItemPlacement.Main && item.Bounds.Height > 0)
+                            bottom = Math.Max(bottom, item.Bounds.Bottom + item.Margin.Bottom);
+                    int height = Math.Max(MinimumSize.Height, bottom + Padding.Bottom);
+                    if (Height != height) Height = height;
+                }
+            }
             finally { layingOut = false; }
         }
     }

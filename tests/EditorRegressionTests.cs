@@ -787,8 +787,6 @@ namespace JsonRightClick
         {
             Console.WriteLine("  toolbar " + phase + ": window=" + viewer.Size + ", client=" + viewer.ClientSize + ", strip=" + strip.Size
                 + ", preferred=" + strip.GetPreferredSize(new Size(strip.Width, 0)) + ", search=" + search.Size + ", count=" + ((ToolStripLabel)Field(viewer, "searchCount")).Text);
-            foreach (ToolStripItem item in strip.Items)
-                if (item.Available) Console.WriteLine("    " + item.GetType().Name + " " + item.Text + ": " + item.Bounds + ", margin=" + item.Margin);
         }
 
         static void TransformationTests()

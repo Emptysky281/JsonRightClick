@@ -94,6 +94,9 @@ namespace JsonRightClick
                     Rectangle overlap = Rectangle.Intersect(items[i].Bounds, items[j].Bounds);
                     Check(overlap.Width == 0 || overlap.Height == 0, "flow rows never overlap or cover a neighboring control");
                 }
+            int bottom = strip.Padding.Top;
+            foreach (var item in items) bottom = Math.Max(bottom, item.Bounds.Bottom + item.Margin.Bottom);
+            Check(strip.Height == bottom + strip.Padding.Bottom, "toolbar height exactly follows laid-out rows, without stale blank rows or a clipped final row");
             Check(fixture.Editor.Top == strip.Bottom && fixture.Editor.Bottom == fixture.Host.ClientSize.Height,
                 "the editor moves below the extra rows and reclaims their height after widening");
             Check(fixture.Search.Text == "original search" && fixture.Toggle.Checked && ((ToolStripMenuItem)fixture.Settings.DropDownItems[0]).Checked,
