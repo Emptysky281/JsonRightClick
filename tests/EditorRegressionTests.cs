@@ -761,9 +761,11 @@ namespace JsonRightClick
                 IntPtr handle = search.Control.Handle;
                 search.Text = "value"; search.TextBox.Focus(); search.TextBox.Select(1, 2);
                 viewer.Width = 1600; Application.DoEvents(); int wideHeight = strip.Height;
+                LogToolbarGeometry("initial wide", viewer, strip, search);
                 foreach (int width in new[] { 600, 420, 280, 1600 })
                 {
                     viewer.Width = width; Application.DoEvents();
+                    LogToolbarGeometry("resize " + width, viewer, strip, search);
                     Check(box.Text == text && search.Text == "value" && search.Control.Handle == handle,
                         "reflow preserves source data, search text and the existing native input handle");
                     Check(search.TextBox.SelectionStart == 1 && search.TextBox.SelectionLength == 2,
@@ -779,6 +781,14 @@ namespace JsonRightClick
                 }
                 Check(strip.Height == wideHeight, "widening restores the original toolbar height");
             }
+        }
+
+        static void LogToolbarGeometry(string phase, JsonViewer viewer, WrappingToolStrip strip, ToolStripTextBox search)
+        {
+            Console.WriteLine("  toolbar " + phase + ": window=" + viewer.Size + ", client=" + viewer.ClientSize + ", strip=" + strip.Size
+                + ", preferred=" + strip.GetPreferredSize(new Size(strip.Width, 0)) + ", search=" + search.Size + ", count=" + ((ToolStripLabel)Field(viewer, "searchCount")).Text);
+            foreach (ToolStripItem item in strip.Items)
+                if (item.Available) Console.WriteLine("    " + item.GetType().Name + " " + item.Text + ": " + item.Bounds + ", margin=" + item.Margin);
         }
 
         static void TransformationTests()
