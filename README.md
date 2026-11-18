@@ -1,195 +1,156 @@
-# JSON 解析助手 (JsonRightClick)
+# JSON 解析助手 · JsonRightClick
 
-在任意程序里选中一段文本（日志、接口返回、聊天记录、普通文字……），右键即可在独立窗口打开并尝试解析其中的 JSON。能解析的内容格式化展示，无法转换的内容保留原文，仍可查看、编辑、搜索、复制。窗口内容不会写回原文件。
+选中一段日志或接口响应，右键就能在独立窗口查看其中的 JSON。可以格式化、搜索、折叠和编辑；找不到可解析的 JSON 时，仍可查看和编辑原文。解析在本机完成，编辑不会写回源文件。
 
-[English](#english)
+[下载发布版][releases] · [Actions 构建][builds] · [English](#english)
 
-![深色主题 + 搜索高亮](docs/dark.png)
+## 快速上手
 
-| 树形视图（浅色） | 敏感字段打码 |
+**系统要求：** Windows 10 / 11，.NET Framework 4.7.2 或更高的 4.x 版本。
+
+1. **下载并解压。** 本文以 `main` 为准，有两种下载方式：
+   - **正式发布版：** 在 [Releases][releases] 的 **Assets** 中下载 `JsonRightClick-*.zip`，不要选 *Source code*。
+   - **main 分支构建：** 想用发布版还没有的功能时，登录 GitHub 后打开 [Actions 构建][builds]，选一条 `main` 分支的成功记录，在 **Artifacts** 中下载 `JsonRightClick`。
+2. **运行主程序。** 把两个 EXE 放在同一个固定、可写的目录（不建议放在 `Program Files`），运行 `JsonRightClick.exe`。程序会在系统托盘驻留；无需单独运行 `JsonRightClickMenu.exe`。
+3. **打开内容。** 在其他应用里选中文字，右键后点光标旁的 **解析 JSON**，或按默认快捷键 `Ctrl+Alt+J`（可在托盘菜单修改）。也可以按下表选择入口：
+
+   | 要打开的内容 | 操作 |
+   | --- | --- |
+   | 剪贴板 | 双击托盘图标，或选「解析剪贴板中的 JSON」 |
+   | `.log`、`.json`、`.txt` 等文件 | 从托盘选「打开文件…」，或在资源管理器右键选「用 JSON 解析助手打开」 |
+   | 想手动粘贴的内容 | 从托盘打开空白窗口，粘贴后按 `Ctrl+Enter` 格式化 |
+
+第一次使用可以打开[示例日志](samples/sample.log)，试试从同一份日志里提取多段 JSON。示例与截图中的账号、令牌均为虚构数据。
+
+## 界面预览
+
+![深色查看器：混合日志中的 JSON 和搜索结果高亮](docs/dark.png)
+
+<details>
+<summary>查看更多截图：浅色树形视图、敏感字段打码</summary>
+
+| 浅色树形视图 | 敏感字段打码 |
 | --- | --- |
-| ![树形视图](docs/light-tree.png) | ![打码](docs/mask.png) |
+| ![右侧树形视图展示日志中的多段 JSON](docs/light-tree.png) | ![打码后的只读界面，敏感字段值显示为星号](docs/mask.png) |
 
-## 功能
+</details>
 
-- **选中文本即用**：选中文字后右键时出现悬浮的「解析 JSON」按钮；也可用全局快捷键（默认 `Ctrl+Alt+J`，可自定义）或托盘菜单解析剪贴板。复制时异步等待剪贴板格式稳定并重试暂时占用/尚未就绪的文本，不会拿旧剪贴板充当选区。
-- **任意选区均可打开**：悬浮按钮仅确认存在文字选区，不预判选中内容是否为合法 JSON。普通文字、不完整 JSON、无可解析片段的日志等，点击后也打开查看窗口；无法转换时保留全部原文并提示，可继续编辑、搜索和重试。只选择空白也不会被当成“未取到文本”；没有实际文字选区时仍不显示按钮，避免游戏误弹。
-- **先取词再关菜单**：点击悬浮按钮后优先直接读取原控件的完整选中文字，再关闭菜单并将查看窗口带到前面；避免 Esc 先取消选区，导致随后 Ctrl+C 复制不到内容而只出现提示。直接读取不可用时才回退复制，慢提供程序稍后返回的完整读数也会用于兜底；普通文字和无效 JSON 一视同仁。不会把旧剪贴板冒充新选区，密码框排除与终端不自动 Ctrl+C 的规则不变。
-- **转义选区兼容**：支持选中完整的 JSON 字符串字面量、无外层引号的转义 JSON 及最多 4 层外层编码；仅在解码后整个内容是合法对象/数组时采用，并明确提示。不会全局删除反斜杠，也不会擅自展开普通 JSON 内的字符串字段。
-- **资源管理器右键菜单**：右键 .log / .json / .txt 等文件「用 JSON 解析助手打开」。Win11 下可放在第一层菜单（需开发人员模式），也可用经典菜单。
-- **混合文本**：从日志里提取多段 JSON，非 JSON 内容原样保留；「只看 JSON」模式下的修改会合并回全文。
-- **查看工具**：树形视图、JSON 路径、全部匹配高亮搜索（支持正则 / 大小写）、敏感字段打码、JWT 解码、时间戳提示、展开嵌套 JSON 字符串、宽松解析（单引号、尾逗号、注释、Python 字面量）、压缩 / 格式化。
-- **括号配对**：将输入光标放在 `{` / `}` / `[` / `]` 的任意一侧（括号前或后），即可同时高亮对应的一对括号；鼠标点击与方向键移动均可触发，无需选中文字，并在左侧折叠栏及文本缩进处显示该层级的竖向范围线；括号在屏幕外时范围线会裁剪到可见区域。另一端超出可视区域时，编辑区顶部或底部显示对应行预览，点击预览即可跳转。展开嵌套、压缩、撤销、只看 JSON、打码及大文件模式下均可使用；字符串内的括号不会误匹配。
-- **智能收紧**：上方工具栏的主按钮默认执行智能数组排版：短普通数组如 `["aaa","bbb"]` 保持单行；对象数组每个元素单独一行，简单对象在该行内显示完整字段，方便上下对比。包含复杂嵌套、超过 6 个字段或超过约 120 字符行预算的对象自动展开；过长普通数组也逐项分行。右侧下拉保留「智能收紧（推荐）」「数组全部单行」「全部展开」三种方式；「数组全部单行」仍会把 `[]` 内的对象 / 数组一起收紧。都是实际排版，不省略数据，不改变字符串、转义、数字精度、属性顺序或类型；支持混合日志、宽松解析、只看 JSON 和打码。`Ctrl+Z` 可撤销并恢复上一种布局，点「格式化」或「全部展开」可回到普通多行格式；不可拆分的长字符串仍遵循独立的「换行」开关进行屏幕软换行。
-- **代码折叠**：编辑区左侧点击 `− / +` 手动折叠或展开对象 / 数组；收起后点击 `{…}` / `[…]` 可展开。工具栏「折叠」及右键「代码折叠」支持当前层级、全部折叠 / 展开；子层级的独立折叠状态会保留。折叠只改变显示，复制、格式化和撤销使用的仍是完整原文，搜索或树形定位会自动展开目标。
-- **悬停提示**：嵌套 JSON 字符串、JWT、时间戳的提示跟随鼠标，在同一段长文本内移动也会更新位置；靠近屏幕边缘自动调整，滚动、编辑或离开编辑区后隐藏。
-- **轻量渐变紫色输入光标**：加粗的紫色渐变亮芯与窄柔光，深浅主题分别调整对比度，仍由 Windows 原生 caret 负责实际位置和闪烁。移动时出现短暂的紫色渐变缓动拖尾，真实输入位置不滞后；只绘制最多 8 段、最长 96 像素的局部彩带，不使用粒子、全屏模糊或全文重绘。动画间隔 25 ms，每次移动后的收尾不超过 160 ms，空闲时定时器完全停止；滚动、失焦、选区、输入法组词、字号变化和远距离跳转会取消拖尾。设置中的「霓虹光标（轻量）」和「光标灵动拖尾（短暂）」可分别开关并记忆，也可只保留无动画的渐变紫色光标。遵循 Windows 关闭界面动画的设置，高对比度和输入法组词时保留系统光标；不改变文本、选区、撤销或滚动位置。
-- **工具栏自动换行**：窗口变窄时，上方放不下的操作自动排到第二行或更多行，编辑区随之下移，不会被遮挡，也不必去溢出菜单里找按钮；窗口拉宽后自动合回。宽度足够时搜索 / 设置区仍靠右，尽量保持在同一行；更窄时搜索框也会缩短并参与换行，拉宽后恢复原宽度。调整布局不会重建搜索输入框、清空搜索文字或改变按钮状态。
-- **界面**：深色 / 浅色主题、导入字体（保存在程序目录 `Fonts\`）、字号记忆、中英文切换、开机自启。
-- 单个 exe，只依赖 Windows 自带的 .NET Framework 4.x，**不联网**。
+## 主要功能
 
-### 无引号 Map 展示文本
-
-设置中启用「宽松解析」后，支持 `{nodes_data: {node: {ip: 192.0.2.1, country: CN, rate: 4Mbps, core: 0}}}` 这类 Map 展示文本：无引号的键和字符串值会补成标准 JSON；`[com.example.app]` 这类数组里的字符串也支持（位于该 Map 内）。IP、数字开头的字母数字 ID 按完整 token 判断，不会只截取数字前缀，真正的数字、布尔值、null、对象和数组保留其类型。原有合法内层 JSON 不变。
-
-此转换仅在严格解析与原有宽松规则均失败、且已经检测到无引号属性名时启用；普通 `[INFO]` 日志标签与严格模式不会被改成字符串数组。状态栏会明确提示推断，不能承诺恢复已丢失的原始类型（例如 `true` / `123` 原来是否带引号）。带空格、逗号或结构分隔符等歧义的字符串仍需加引号；不会靠删反斜杠、猜分隔符或执行代码来“修复”。无法整体解析时，若只能提取合法片段，仍会提示并保留原文。
-
-若能控制数据来源，优先输出标准 JSON，而不要用 Map 的展示字符串代替序列化结果。
-
-### 悬浮按钮的多通道选区识别
-
-- 只有原文字区域提供真实非空选区证据，才显示「解析 JSON」按钮：标准 Edit / RichEdit / Scintilla 使用原生接口；其他控件依次使用 MSAA + IAccessible2、UI Automation TextPattern。兼容没有 TextPattern 的 Chromium / Electron / Firefox 文本提供程序，不依赖软件进程名白名单。
-- 右键按下时就开始读取选区，短时间保留同一次手势的真实证据，避免菜单弹出后遮住文字或改变焦点。冷启动提供程序可从保存的原控件再确认；无选区叶节点不会提前截断父 Document/编辑器的选区查询。
-- UIA 在原命中点所在的可见分支中有界寻找虚拟文档；父文档里其他位置的选区不能让画布/图片点击也触发。密码框、普通光标和仅图片占位符仍不算文本选区。
-- 拖动、双击、Shift、Ctrl+A 或剪贴板变化本身都不是证据，不恢复游戏操作误弹的手势推测，也不查询其他窗口的旧选区。键盘、左键、滚轮或切换窗口会作废待显示结果。
-- 所有查询在后台进行，同一时间最多一项；只读取选区位置和少量选中文字样本，不模拟 Ctrl+C、不改剪贴板。不提供任何可靠选区接口的软件仍不自动弹出，可手动复制后从托盘解析；终端快捷键只读取已有剪贴板，不发送 Ctrl+C。
-
-### 滚动与大文本性能
-
-- 滚动期间不移动光标或反复着色；停下后按约 6 ms 的小时间片补色，优先处理可见内容。
-- 词法结果、字体尺寸与文档长度复用缓存，纯着色不会使搜索、DOM 或括号缓存失效。
-- 长搜索匹配只计算屏幕内的显示行；编辑区与侧栏合成呈现以减少闪烁。
-- 超长文件也按真实像素平滑滚动，不再退回整行跳动；首个小位移在滚轮输入时立即发生，反向输入会立刻反向。
-- 使用 Windows 原生高精度等待计时器，避免 .NET Timer 将 16 ms 请求量化为约 31 ms。根据屏幕刷新率选择约 7–16 ms 的帧间隔，UI 忙时只保留一个待处理帧，空闲时不轮询；不可用时自动回退。滚动条、键盘、失焦或窗口关闭会取消动画。
-- 路径/DOM、搜索、树形重建及长字符串悬停解码在滚动动画结束后处理，避免后台辅助功能抢占滚动帧。
-- 失焦后悬停滚动，再激活或点击编辑区时保持当前浏览位置；恢复焦点及输入法光标位置查询不再把视口拉回旧光标。真实输入、输入法组合及显式搜索/树形跳转仍可正常定位。
-- 折叠、复制、撤销及敏感字段打码的语义不变。
-
-### 折叠快捷键
-
-| 操作 | 快捷键 |
+| 你想做什么 | 对应功能 |
 | --- | --- |
-| 折叠当前层级 | `Ctrl+Shift+[` |
-| 展开当前层级 | `Ctrl+Shift+]` |
-| 全部折叠 | `Ctrl+Alt+[` |
-| 全部展开 | `Ctrl+Alt+]` |
+| **整理混合日志** | 提取多段 JSON 对象或数组，保留非 JSON 日志；可格式化、压缩。切换「只看 JSON」后编辑片段，再切回时会合并修改；有多个片段时请保留分隔标题行。 |
+| **逐行对比数组元素** | 「智能收紧」让短普通数组保持单行、对象数组每项一行，复杂或过长的对象自动展开。也可选择「数组全部单行」或「全部展开」，不省略数据。 |
+| **在长文本中定位字段** | `Ctrl+F` 高亮全部匹配，支持正则和大小写选项；树形视图可跳转到字段并复制 JSON 路径。编辑区支持折叠、括号配对和可点击的屏外配对行预览。折叠只影响显示，不删除文本。 |
+| **查看嵌套值** | 展开嵌套 JSON 字符串，查看时间戳提示，或解码 JWT。JWT 解码只展示内容，**不验证签名**。 |
+| **截图或复制前打码** | 将命中的敏感 JSON 字段和识别出的 JWT 打码；打码时只读，复制的是显示内容。普通日志文本不会自动脱敏，分享前仍需检查。 |
 
-在折叠块边界按 Backspace / Delete 会先展开，避免误删隐藏内容；再次按键才进行普通删除。
+界面支持深浅主题、自定义字体和字号、软换行、窗口置顶及中英文切换。窗口变窄时工具栏自动换行，保留搜索内容。渐变光标与拖尾可分别开关；大文本按视口分批着色。
 
-### 智能收紧示例
+<details>
+<summary>智能收紧示例</summary>
+
+短普通数组保持单行，简单对象在数组中各占一行，方便比较字段：
 
 ```json
 {
-  "router": [
-    {"name": "global", "chains": ["line1"], "fallback": "direct"},
-    {"name": "game.exe", "chains": ["line1"], "fallback": "direct"}
+  "tags": ["api","prod"],
+  "requests": [
+    {"path": "/health", "status": 200},
+    {"path": "/users", "status": 503}
   ]
 }
 ```
 
-## 系统要求
+包含复杂嵌套、字段超过 6 个或行宽超出约 120 字符预算的对象会按需展开。排版保留属性顺序、重复键、数值精度、类型和字符串转义。`Ctrl+Z` 可撤销排版，点「格式化」可恢复普通多行缩进。
 
-- Windows 10 / 11（Win11 第一层右键菜单需要打开「开发人员模式」）
-- .NET Framework 4.7.2 或更高（Win10 1803+ 自带）
+</details>
 
-## 使用
+<details>
+<summary>转义 JSON 与宽松解析</summary>
 
-1. 从 [Releases](../../releases) 下载，或自己编译（见下）。
-2. 把 `JsonRightClick.exe` 和 `JsonRightClickMenu.exe` 放在同一个**固定的、可写的**文件夹里（不要放在 Program Files，设置文件要写在程序旁边）。
-3. 运行 `JsonRightClick.exe`，程序驻留托盘并自动注册右键菜单。
+- 支持完整的 JSON 字符串字面量或无外层引号的转义 JSON，最多解码 4 层。只有解码后整段内容是合法对象或数组时才采用，不会全局删反斜杠，也不会自动展开普通 JSON 中的字符串字段。
+- 启用「宽松解析」后，可处理单引号、尾逗号、注释和 Python 字面量，也能尝试转换 `{ip: 192.0.2.1, country: CN, online: true}` 之类的 Map 展示文本。状态栏会提示类型推断；已经丢失的类型信息无法恢复，含歧义分隔符的值仍需加引号。能控制数据来源时，优先输出标准 JSON。
 
-> 目标程序以管理员身份运行时，Windows 不允许普通程序读取它的选中内容，可在托盘菜单里选择「以管理员身份重新启动」。
+</details>
 
-## 编译
+## 常用快捷键
 
-不需要 Visual Studio：
-
-```bat
-build.bat
-```
-
-使用系统自带的 `csc.exe` 生成两个 exe：
-
-| 文件 | 作用 |
+| 操作 | 快捷键 |
 | --- | --- |
-| `JsonRightClick.exe` | 主程序：托盘、悬浮按钮、查看窗口 |
-| `JsonRightClickMenu.exe` | Win11 第一层右键菜单的 COM 服务（带稀疏包身份，manifest 见 `appmenu.manifest`） |
+| 从选区打开（全局，默认） | `Ctrl+Alt+J` |
+| 格式化 / 撤销 | `Ctrl+Enter` / `Ctrl+Z` |
+| 搜索 / 下一个 / 上一个 | `Ctrl+F` / `F3` / `Shift+F3` |
+| 折叠 / 展开当前层级 | `Ctrl+Shift+[` / `Ctrl+Shift+]` |
+| 折叠 / 展开全部 | `Ctrl+Alt+[` / `Ctrl+Alt+]` |
 
-### 不打扰桌面的工具栏布局测试
+## 常见问题
 
-```powershell
-./tests/run-toolbar-headless-tests.ps1
-```
+- **右键没出现「解析 JSON」？** 只有源应用能确认文字选区时才会显示。密码框被排除；没有文字选区、控件不提供选区或响应超时，也不会弹出。可以先手动复制，再双击托盘图标。
+- **在终端里怎么用？** 先手动复制，再解析剪贴板。工具不会在终端自动发送 `Ctrl+C`，以免中断正在运行的程序。
+- **目标窗口以管理员身份运行？** 可以手动复制后解析；需要直接取词时，可在托盘菜单选择「以管理员身份重新启动」。
+- **Win11 右键文件没找到菜单？** 经典模式在「显示更多选项」里。需要第一层菜单时，可在托盘的「资源管理器右键菜单」中切换到 Win11 第一层模式；只有这个模式需要开启开发人员模式。
+- **日志大于 20 MB？** 打开时可选择只读前 20 MB、全部加载或取消，不会改动文件。
 
-仅在内存中对不可见的 WinForms 控件做布局计算，测试会验证没有创建原生窗口句柄；不会显示窗口、抢焦点、发送键鼠或访问剪贴板。覆盖中英文、不同字体大小、单行与多行切换、编辑区停靠、搜索框宽度恢复、动态匹配计数以及反复调整尺寸的稳定性。
+## 本地设置与卸载
 
-### 不打扰桌面的数组排版测试
+- **设置：** 通常保存在程序旁的 `settings.ini`；目录不可写时回退到 `HKCU\Software\JsonRightClick`。
+- **剪贴板：** 取词优先直接读取选区，回退到复制时才会临时使用系统剪贴板。默认尝试恢复原剪贴板，不覆盖后续复制的新内容。
+- **卸载：** 在托盘将「资源管理器右键菜单」设为「关闭」，取消「开机自动启动」，退出程序，再删除程序目录。
 
-```powershell
-./tests/run-array-headless-tests.ps1
-```
+## 从源码构建
 
-只运行纯解析 / 格式化测试，不创建窗口、不模拟输入或访问剪贴板。覆盖全部单行 / 智能排版两种模式、对象数组逐项分行、复杂对象和长行展开、嵌套数组、字符串转义、外层缩进恢复、重复属性与数值精度、宽松解析、嵌套展开、混合日志、JSON-only 合并、无效输入保留、随机往返与大数组。完整工具栏点击、撤销、打码和折叠的交互回归仍在 `run-tests.ps1` 中，需在电脑空闲或 CI 环境运行。
-
-### 不打扰桌面的光标测试
-
-```powershell
-./tests/run-caret-headless-tests.ps1
-# 可选：在 .test-output/purple-caret-preview 中生成离屏示意帧
-./tests/run-caret-headless-tests.ps1 -Preview
-```
-
-此入口只测试纯几何模型和 Bitmap 绘制，不创建编辑窗口、不抢焦点、不模拟输入、不使用剪贴板或写入用户设置。检查渐变颜色、XOR 编码、长度与寿命上限、密集移动重定向、绘图裁剪、原生 caret 区域避让和 GDI 资源释放；离屏耗时不等同于真实桌面帧率。`run-tests.ps1` 和滚动基准会打开交互窗口，需在电脑空闲或 CI 环境运行。
-
-## 卸载
-
-1. 托盘菜单 →「资源管理器右键菜单」→ 关闭（会同时移除稀疏包和经典菜单注册表项）。
-2. 关闭「开机自动启动」，然后退出。
-3. 删除程序文件夹。
-
-## 数据与隐私
-
-- 设置保存在程序目录的 `settings.ini`（删除即恢复默认），目录不可写时回退到 `HKCU\Software\JsonRightClick`。
-- 程序不发起任何网络请求，解析的内容只在内存中，不会保存。
-
-## 自检
-
-```bat
-JsonRightClick.exe --selftest samples\sample.log out.txt
-JsonRightClick.exe --uitest samples\sample.log out.txt
-```
-
-`samples/sample.log` 中的账号、令牌均为虚构数据。
-
-编辑器交互回归测试（Windows，使用系统自带的编译器，无需额外测试依赖）：
+在 Windows 的仓库根目录运行以下命令。构建使用 .NET Framework 的 `csc.exe`，无需 Visual Studio。
 
 ```powershell
+.\build.bat
+```
+
+生成 `JsonRightClick.exe`（托盘和查看器）与 `JsonRightClickMenu.exe`（Win11 第一层菜单的 COM 服务）。使用时将两个文件放在同一目录。
+
+<details>
+<summary>自检、无界面测试与交互回归</summary>
+
+样例自检及无界面测试不打开编辑窗口：
+
+```powershell
+.\JsonRightClick.exe --selftest .\samples\sample.log selftest.txt
+.\tests\run-array-headless-tests.ps1
+.\tests\run-toolbar-headless-tests.ps1
+.\tests\run-caret-headless-tests.ps1
+```
+
+编辑器回归和滚动基准会打开窗口，建议在桌面空闲时或 CI 环境中运行：
+
+```powershell
+.\JsonRightClick.exe --uitest .\samples\sample.log uitest.txt
 .\tests\run-tests.ps1
-```
-
-测试产物位于 `.test-output/`，覆盖括号匹配、代码折叠与父子状态、折叠复制及撤销、搜索 / 树形定位、嵌套展开、视图切换、长文本提示定位、屏幕边界和大文件着色；不改写现有程序的显示设置。
-
-滚动性能基准（可选，用同一份 5000 条嵌套记录及 12.5 万字符搜索匹配对比本地旧提交）：
-
-```powershell
 .\tests\run-scroll-benchmark.ps1 -BaselineRef 88b0707
 ```
 
-基准会确认文档确实滚动，报告帧时钟真实投递间隔 P50 / P95、补色总耗时 / 最长时间片、选区事件数、滚动绘制 P50 / P95 和长匹配重绘耗时。结果写入 `.test-output/`；不同机器、字体和文档的结果会有差异。
+测试产物保存在 `.test-output/`；两个自检命令各自写入指定的报告文件。为光标测试添加 `-Preview` 可生成离屏示意帧。滚动基准需要本地 Git 历史中的对比提交，报告帧投递、绘制、补色和选区事件等指标。
+
+</details>
+
+## English
+
+**JsonRightClick** opens selected text, clipboard contents, or local files in a Windows JSON viewer. It extracts and formats JSON within mixed logs, keeps text it cannot parse, and never writes edits back to the source file. Parsing runs locally.
+
+**Requirements:** Windows 10 or 11 and .NET Framework 4.7.2 or later in the 4.x series.
+
+1. Download the ZIP from [Releases][releases]. This README describes `main`; for features not yet in a release, sign in to GitHub, open a successful `main` run under [Actions][builds], and download the `JsonRightClick` artifact.
+2. Extract both executables into the same writable folder. Run `JsonRightClick.exe`; it stays in the system tray.
+3. Select text and right-click → **Parse JSON**, or press `Ctrl+Alt+J` (default). You can also double-click the tray icon to parse the clipboard or choose **Open file…** from the tray menu.
+
+The viewer includes smart array layout, JSON-only editing, regex search, code folding and bracket matching, a tree view with JSON paths, sensitive-field masking, nested JSON expansion, timestamp hints, and JWT decoding without signature verification.
+
+**No floating button?** Some apps do not expose their selection. Copy the text manually and use the tray; in terminals the tool never sends `Ctrl+C`. On Windows 11, the classic file menu is under **Show more options**. Only the optional top-level Explorer menu needs Developer Mode.
+
+**Build** with `build.bat` on Windows; Visual Studio is not required. **Uninstall** by turning off the Explorer menu and auto-start from the tray, exiting, and deleting the folder.
 
 ## License
 
 [MIT](LICENSE)
 
----
-
-## English
-
-**JsonRightClick** formats JSON embedded in any selected text (logs, API responses, chat messages) and shows it in a separate editable window. Nothing is written back to the source.
-
-- Select text → right-click → floating **Parse JSON** button, or a global hotkey (default `Ctrl+Alt+J`), or parse the clipboard from the tray. The button requires a confirmed nonempty text selection, using native Edit/RichEdit/Scintilla, MSAA/IAccessible2 and UIA TextPattern providers. It starts probing before context menus obscure the text; unknown, unsupported or timed-out providers stay hidden. Mouse gestures and clipboard changes are never treated as proof. Copy manually and use the tray if an application does not expose its text selection.
-- File Explorer context menu for .log / .json / .txt files (Windows 11 top-level menu via a sparse package with Developer Mode, or the classic menu).
-- Keeps non-JSON text intact; edits made in *JSON only* mode are merged back.
-- Tree view, JSON path, highlight-all search with regex, sensitive-field masking, JWT decoding, timestamp hints, nested-JSON expansion, lenient parsing.
-- Matching-bracket highlights, with a clickable line preview when the other bracket is off screen; works after expanding nested JSON strings.
-- Scope guides connect matching brackets in the left gutter and indentation area, clipped to the visible viewport.
-- Cached native layout and tokenization, budgeted non-selection coloring, and viewport-bounded search highlights reduce scrolling stalls and text flicker.
-- **Smart compact** split-button: short scalar arrays stay inline; object arrays split into one item per line, keeping simple objects on their own compact row. Complex objects, objects over 6 fields or the approximate 120-character line budget, and overly long scalar arrays expand automatically. The dropdown also retains **All arrays on one line** and **Expand all**. No values are hidden or converted: strings/escapes, number precision, duplicate keys and property order stay intact. Ctrl+Z restores the previous text and layout; JSON-only view and masking retain the selected layout. Long indivisible strings still obey the separate Word wrap setting.
-- IDEA-style code folding with a left gutter, clickable placeholders, current/all-level menu actions and keyboard shortcuts; the complete source text and editing undo history are retained.
-- Hover hints follow the pointer, including within very long wrapped strings, and stay within the screen.
-- The top toolbar automatically wraps into additional rows when narrow and returns to fewer rows when widened; actions are not hidden in an overflow popup. The editor docks below all rows. Search/settings stay right-aligned when possible, and the search box shrinks if needed without being recreated or losing text/state.
-- Dark / light theme, custom fonts, remembered font size, Chinese / English UI, start with Windows.
-- Lightweight purple-gradient insertion caret: cached lavender-to-violet core and narrow glow, native Windows position/blinking, plus a brief movement-only ribbon (8 segments, at most 96 px, 25 ms timer interval, at most 160 ms to settle). The real insertion point never lags. No particles, full-screen blur or document scan; the timer stops while idle. Scrolling, selection, focus loss, IME composition and layout changes cancel the trail. Settings remember separate caret/trail toggles; disabling just the trail retains a static purple-gradient caret. Windows reduced-animation preferences are respected; high-contrast mode and IME composition keep the system caret.
-- Single exe on the built-in .NET Framework 4.x. No network access.
-
-Build with `build.bat` (no Visual Studio needed). Keep both exes in the same writable folder and run `JsonRightClick.exe`. To uninstall, turn off the context menu and autostart from the tray menu, exit, and delete the folder.
+[releases]: https://github.com/Emptysky281/JsonRightClick/releases/latest
+[builds]: https://github.com/Emptysky281/JsonRightClick/actions/workflows/build.yml
